@@ -11,34 +11,77 @@ $user_id = $_SESSION['user_id'];
 $action = $_GET['action'] ?? 'list';
 $error = ''; $success = '';
 
-// Handle verification POST
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $app_id = intval($_POST['application_id']);
-    $status  = sanitize($_POST['verification_status']);
+// ── Handle per-file review ────────────────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['file_review'])) {
+    $app_id       = intval($_POST['application_id']);
+    $req_label    = sanitize($_POST['requirement_label']);
+    $review_status = sanitize($_POST['review_status']); // 'accepted' or 'rejected'
+    $remarks      = sanitize($_POST['remarks'] ?? '');
+
+    if ($review_status === 'rejected' && empty($remarks)) {
+        $error = 'Remarks are required when rejecting a file.';
+    } else {
+        $stmt = $conn->prepare("INSERT INTO application_requirement_reviews
+            (application_id, evaluator_id, requirement_label, review_status, remarks)
+            VALUES (?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                review_status = VALUES(review_status),
+                remarks = VALUES(remarks),
+                evaluator_id = VALUES(evaluator_id),
+                reviewed_at = NOW()");
+        $stmt->bind_param("iisss", $app_id, $user_id, $req_label, $review_status, $remarks);
+        if ($stmt->execute()) {
+            $success = 'File review saved.';
+        } else {
+            $error = 'Failed to save review: ' . $conn->error;
+        }
+    }
+    $action = 'review';
+    // Keep on review page
+    header('Location: ?action=review&id=' . intval($_POST['application_id']));
+    exit();
+}
+
+// ── Handle overall application verification ───────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['verification_status'])) {
+    $app_id   = intval($_POST['application_id']);
+    $status   = sanitize($_POST['verification_status']);
     $feedback = sanitize($_POST['feedback'] ?? '');
 
-    $stmt = $conn->prepare("INSERT INTO application_verification (application_id, evaluator_id, verification_status, feedback, verified_at) VALUES (?, ?, ?, ?, NOW())");
-    $stmt->bind_param("iiss", $app_id, $user_id, $status, $feedback);
+    if ($status === 'returned' && empty($feedback)) {
+        $error = 'Remarks are required when returning an application.';
+    } else {
+        $stmt = $conn->prepare("INSERT INTO application_verification
+            (application_id, evaluator_id, verification_status, feedback, verified_at)
+            VALUES (?, ?, ?, ?, NOW())");
+        $stmt->bind_param("iiss", $app_id, $user_id, $status, $feedback);
 
-    if ($stmt->execute()) {
-        $new_status = $status === 'verified' ? 'verified' : ($status === 'returned' ? 'incomplete' : $status);
-        $upd = $conn->prepare("UPDATE hdp_applications SET status = ? WHERE id = ?");
-        $upd->bind_param("si", $new_status, $app_id);
-        $upd->execute();
+        if ($stmt->execute()) {
+            $new_status = $status === 'verified' ? 'verified' : 'incomplete';
+            $upd = $conn->prepare("UPDATE hdp_applications SET status = ? WHERE id = ?");
+            $upd->bind_param("si", $new_status, $app_id);
+            $upd->execute();
 
-        $owner_q = $conn->prepare("SELECT business_owner_id FROM hdp_applications WHERE id = ?");
-        $owner_q->bind_param("i", $app_id);
-        $owner_q->execute();
-        $owner = $owner_q->get_result()->fetch_assoc();
-        if ($owner) {
-            createNotification($conn, $owner['business_owner_id'], 'Application ' . ucfirst($status),
-                'Your HDP application has been ' . $status . '.',
-                $status === 'verified' ? 'success' : 'warning',
-                BASE_URL . 'dashboard/business_owner/applications.php');
+            $owner_q = $conn->prepare("SELECT business_owner_id FROM hdp_applications WHERE id = ?");
+            $owner_q->bind_param("i", $app_id);
+            $owner_q->execute();
+            $owner = $owner_q->get_result()->fetch_assoc();
+            if ($owner) {
+                $msg = $status === 'verified'
+                    ? 'Your HDP application has been approved.'
+                    : 'Your HDP application has been returned. Please check the evaluator\'s feedback and resubmit.';
+                createNotification($conn, $owner['business_owner_id'],
+                    'Application ' . ($status === 'verified' ? 'Approved' : 'Returned'),
+                    $msg,
+                    $status === 'verified' ? 'success' : 'warning',
+                    BASE_URL . 'dashboard/business_owner/applications.php');
+            }
+            logActivity($conn, $user_id, 'Application Verified', 'App #' . $app_id . ' ' . $status, 'evaluation');
+            $success = 'Application ' . $status . '.';
+            $action = 'list';
+        } else {
+            $error = 'Failed to save: ' . $conn->error;
         }
-        logActivity($conn, $user_id, 'Application Verified', 'App #' . $app_id . ' ' . $status, 'evaluation');
-        $success = 'Application verification saved.';
-        $action = 'list';
     }
 }
 
@@ -50,16 +93,27 @@ require_once __DIR__ . '/../../includes/header.php';
 <?php if ($success): ?>
     <div class="alert alert-success"><i class="fas fa-check-circle"></i><span><?= $success ?></span><button class="close-alert"><i class="fas fa-times"></i></button></div>
 <?php endif; ?>
+<?php if ($error): ?>
+    <div class="alert alert-danger"><i class="fas fa-exclamation-circle"></i><span><?= $error ?></span><button class="close-alert"><i class="fas fa-times"></i></button></div>
+<?php endif; ?>
 
 <?php if ($action === 'list'): ?>
 <?php
 $where = $filter === 'all' ? '' : "WHERE ha.status = '$filter'";
-$apps = $conn->query("SELECT ha.*, loi.company_name, u.full_name as owner_name FROM hdp_applications ha JOIN letter_of_intent loi ON ha.loi_id = loi.id JOIN users u ON ha.business_owner_id = u.id $where ORDER BY ha.created_at DESC")->fetch_all(MYSQLI_ASSOC);
+$apps = $conn->query("
+    SELECT ha.*, loi.company_name, u.full_name as owner_name,
+        (SELECT COUNT(*) FROM application_verification av WHERE av.application_id = ha.id AND av.verification_status = 'returned') as was_returned
+    FROM hdp_applications ha
+    JOIN letter_of_intent loi ON ha.loi_id = loi.id
+    JOIN users u ON ha.business_owner_id = u.id
+    $where ORDER BY ha.created_at DESC
+")->fetch_all(MYSQLI_ASSOC);
 ?>
 <div class="card" style="margin-bottom: 16px;">
     <div class="card-body" style="display: flex; gap: 8px;">
         <a href="?filter=submitted" class="btn btn-sm <?= $filter === 'submitted' ? 'btn-primary' : 'btn-secondary' ?>">Pending</a>
         <a href="?filter=verified" class="btn btn-sm <?= $filter === 'verified' ? 'btn-primary' : 'btn-secondary' ?>">Verified</a>
+        <a href="?filter=incomplete" class="btn btn-sm <?= $filter === 'incomplete' ? 'btn-primary' : 'btn-secondary' ?>">Returned</a>
         <a href="?filter=all" class="btn btn-sm <?= $filter === 'all' ? 'btn-primary' : 'btn-secondary' ?>">All</a>
     </div>
 </div>
@@ -78,7 +132,14 @@ $apps = $conn->query("SELECT ha.*, loi.company_name, u.full_name as owner_name F
                         <tr>
                             <td><strong><?= htmlspecialchars($app['company_name']) ?></strong></td>
                             <td><?= htmlspecialchars($app['owner_name']) ?></td>
-                            <td><?= getStatusBadge($app['status']) ?></td>
+                            <td>
+                                <?= getStatusBadge($app['status']) ?>
+                                <?php if ($app['status'] === 'submitted' && $app['was_returned'] > 0): ?>
+                                    <span class="badge badge-info" style="margin-left:4px;font-size:0.72rem;">
+                                        <i class="fas fa-redo"></i> Revised
+                                    </span>
+                                <?php endif; ?>
+                            </td>
                             <td style="font-size:0.85rem;color:var(--neutral-500)"><?= $app['submitted_at'] ? formatDate($app['submitted_at']) : '-' ?></td>
                             <td>
                                 <a href="?action=review&id=<?= $app['id'] ?>" class="btn btn-sm btn-primary">
@@ -113,6 +174,17 @@ if ($app) {
     }
 }
 
+// Load existing file reviews
+$reviews = [];
+if ($app) {
+    $rv = $conn->prepare("SELECT * FROM application_requirement_reviews WHERE application_id = ?");
+    $rv->bind_param("i", $app_id);
+    $rv->execute();
+    foreach ($rv->get_result()->fetch_all(MYSQLI_ASSOC) as $row) {
+        $reviews[$row['requirement_label']] = $row;
+    }
+}
+
 $requirement_labels = [
     '1. Letter of Intent',
     '2.1 Company Profile',
@@ -133,13 +205,16 @@ $requirement_labels = [
     '2.16 Appointment of Muslim cook and crew',
     '2.17 Halal Assurance System Manual',
 ];
+
+$accepted_count = count(array_filter($reviews, fn($r) => $r['review_status'] === 'accepted'));
+$rejected_count = count(array_filter($reviews, fn($r) => $r['review_status'] === 'rejected'));
 ?>
 <?php if ($app): ?>
 <a href="?action=list&filter=<?= $filter ?>" class="btn btn-outline btn-sm" style="margin-bottom:20px;"><i class="fas fa-arrow-left"></i> Back</a>
 
 <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 24px; align-items: start;">
 
-    <!-- Submitted Files -->
+    <!-- Files + per-file review -->
     <div class="card">
         <div class="card-header">
             <h3><i class="fas fa-folder-open" style="color:var(--primary-600);margin-right:8px;"></i>
@@ -150,24 +225,107 @@ $requirement_labels = [
         <div class="card-body" style="padding:0;">
             <table class="table" style="margin:0;">
                 <thead>
-                    <tr><th>#</th><th>Requirement</th><th>File</th></tr>
+                    <tr>
+                        <th style="width:40%;">Requirement</th>
+                        <th>File</th>
+                        <th>Review Status</th>
+                        <?php if ($app['status'] === 'submitted'): ?>
+                        <th style="width:200px;">Action</th>
+                        <?php endif; ?>
+                    </tr>
                 </thead>
                 <tbody>
                     <?php foreach ($requirement_labels as $i => $label): ?>
-                    <?php $file = $uploads[$label] ?? null; ?>
-                    <tr>
-                        <td style="color:var(--neutral-400);font-size:0.85rem;"><?= $i + 1 ?></td>
-                        <td style="font-size:0.9rem;color:var(--neutral-700);"><?= htmlspecialchars($label) ?></td>
-                        <td>
+                    <?php
+                        $file   = $uploads[$label] ?? null;
+                        $review = $reviews[$label] ?? null;
+                    ?>
+                    <tr id="row-<?= $i ?>">
+                        <td style="font-size:0.88rem;color:var(--neutral-700);vertical-align:middle;">
+                            <?= htmlspecialchars($label) ?>
+                        </td>
+                        <td style="vertical-align:middle;">
                             <?php if ($file): ?>
                                 <a href="<?= BASE_URL ?>uploads/<?= $file['file_path'] ?>" target="_blank"
-                                   class="btn btn-sm btn-outline" style="font-size:0.8rem;">
+                                   class="btn btn-sm btn-outline" style="font-size:0.78rem;">
                                     <i class="fas fa-file"></i> View
                                 </a>
+                            <?php else: ?>
+                                <span style="font-size:0.8rem;color:var(--neutral-300);">Not uploaded</span>
+                            <?php endif; ?>
+                        </td>
+                        <td style="vertical-align:middle;">
+                            <?php if ($review): ?>
+                                <?php if ($review['review_status'] === 'accepted'): ?>
+                                    <span class="badge badge-success"><i class="fas fa-check"></i> Accepted</span>
+                                <?php else: ?>
+                                    <span class="badge badge-danger"><i class="fas fa-times"></i> Rejected</span>
+                                    <?php if ($review['remarks']): ?>
+                                        <br><small style="color:var(--neutral-500);font-size:0.75rem;" title="<?= htmlspecialchars($review['remarks']) ?>">
+                                            <i class="fas fa-comment"></i> <?= htmlspecialchars(mb_strimwidth($review['remarks'], 0, 40, '…')) ?>
+                                        </small>
+                                    <?php endif; ?>
+                                <?php endif; ?>
                             <?php else: ?>
                                 <span style="font-size:0.8rem;color:var(--neutral-300);">—</span>
                             <?php endif; ?>
                         </td>
+                        <?php if ($app['status'] === 'submitted'): ?>
+                        <td style="vertical-align:middle;">
+                            <?php if ($file): ?>
+                            <?php if ($review && $review['review_status'] === 'accepted'): ?>
+                                <!-- Already accepted — no action -->
+                                <span style="font-size:0.78rem;color:var(--neutral-400);">—</span>
+                            <?php else: ?>
+                            <div style="display:flex;gap:6px;align-items:center;">
+                                <!-- Accept button -->
+                                <form method="POST" style="display:inline;">
+                                    <input type="hidden" name="file_review" value="1">
+                                    <input type="hidden" name="application_id" value="<?= $app_id ?>">
+                                    <input type="hidden" name="requirement_label" value="<?= htmlspecialchars($label) ?>">
+                                    <input type="hidden" name="review_status" value="accepted">
+                                    <input type="hidden" name="remarks" value="">
+                                    <button type="submit" class="btn btn-sm btn-success"
+                                        title="Accept this file"
+                                        style="padding:4px 10px;">
+                                        <i class="fas fa-check"></i>
+                                    </button>
+                                </form>
+                                <!-- Reject button — opens inline remarks -->
+                                <button type="button" class="btn btn-sm btn-danger"
+                                    title="Reject this file"
+                                    style="padding:4px 10px;"
+                                    onclick="toggleRejectForm(<?= $i ?>)">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                            </div>
+                            <!-- Reject form (hidden by default) -->
+                            <div id="rejectForm-<?= $i ?>" style="display:none;margin-top:8px;">
+                                <form method="POST">
+                                    <input type="hidden" name="file_review" value="1">
+                                    <input type="hidden" name="application_id" value="<?= $app_id ?>">
+                                    <input type="hidden" name="requirement_label" value="<?= htmlspecialchars($label) ?>">
+                                    <input type="hidden" name="review_status" value="rejected">
+                                    <textarea name="remarks" class="form-control" rows="2"
+                                        placeholder="Remarks required for rejection..."
+                                        style="font-size:0.8rem;margin-bottom:6px;"
+                                        id="remarks-<?= $i ?>"></textarea>
+                                    <div style="display:flex;gap:6px;">
+                                        <button type="submit" class="btn btn-sm btn-danger"
+                                            onclick="return validateRemarks(<?= $i ?>)">
+                                            <i class="fas fa-times-circle"></i> Reject
+                                        </button>
+                                        <button type="button" class="btn btn-sm btn-outline"
+                                            onclick="toggleRejectForm(<?= $i ?>)">Cancel</button>
+                                    </div>
+                                </form>
+                            </div>
+                            <?php endif; ?>
+                            <?php else: ?>
+                                <span style="font-size:0.78rem;color:var(--neutral-300);">No file</span>
+                            <?php endif; ?>
+                        </td>
+                        <?php endif; ?>
                     </tr>
                     <?php endforeach; ?>
                 </tbody>
@@ -181,32 +339,41 @@ $requirement_labels = [
             <h3><i class="fas fa-clipboard-check" style="color:var(--primary-600);margin-right:8px;"></i> Verification</h3>
         </div>
         <div class="card-body">
-            <div style="margin-bottom:16px;">
+            <div style="margin-bottom:12px;">
                 <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;">Company</div>
                 <div style="font-weight:600;"><?= htmlspecialchars($app['company_name']) ?></div>
             </div>
-            <div style="margin-bottom:16px;">
+            <div style="margin-bottom:12px;">
                 <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;">Submitted By</div>
                 <div><?= htmlspecialchars($app['owner_name']) ?></div>
                 <div style="font-size:0.85rem;color:var(--neutral-400);"><?= htmlspecialchars($app['owner_email']) ?></div>
             </div>
             <div style="margin-bottom:20px;">
-                <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;">Files Uploaded</div>
-                <div style="font-size:1.1rem;font-weight:700;color:var(--primary-600);"><?= count($uploads) ?> / <?= count($requirement_labels) ?></div>
+                <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;margin-bottom:6px;">File Review Progress</div>
+                <div style="display:flex;gap:12px;font-size:0.85rem;">
+                    <span style="color:var(--success);font-weight:600;"><i class="fas fa-check-circle"></i> <?= $accepted_count ?> accepted</span>
+                    <span style="color:var(--danger);font-weight:600;"><i class="fas fa-times-circle"></i> <?= $rejected_count ?> rejected</span>
+                    <span style="color:var(--neutral-400);"><?= count($uploads) - $accepted_count - $rejected_count ?> pending</span>
+                </div>
+                <div style="background:var(--neutral-100);border-radius:99px;height:6px;overflow:hidden;margin-top:8px;">
+                    <div style="background:var(--primary-500);height:100%;width:<?= count($uploads) > 0 ? round(($accepted_count / count($requirement_labels)) * 100) : 0 ?>%;"></div>
+                </div>
+                <div style="font-size:0.75rem;color:var(--neutral-400);margin-top:4px;"><?= count($uploads) ?> / <?= count($requirement_labels) ?> files uploaded</div>
             </div>
 
             <?php if ($app['status'] === 'submitted'): ?>
-            <form method="POST">
+            <form method="POST" id="overallVerifyForm">
                 <input type="hidden" name="application_id" value="<?= $app['id'] ?>">
                 <div class="form-group">
-                    <label>Feedback / Remarks</label>
-                    <textarea name="feedback" class="form-control" rows="4" placeholder="Optional notes..."></textarea>
+                    <label>Overall Feedback / Remarks</label>
+                    <textarea name="feedback" id="appFeedback" class="form-control" rows="4"
+                        placeholder="Required if returning — optional for approval..."></textarea>
                 </div>
                 <div style="display:flex;flex-direction:column;gap:10px;margin-top:8px;">
                     <button type="submit" name="verification_status" value="verified" class="btn btn-success">
-                        <i class="fas fa-check-circle"></i> Approve
+                        <i class="fas fa-check-circle"></i> Approve Application
                     </button>
-                    <button type="submit" name="verification_status" value="returned" class="btn btn-danger">
+                    <button type="button" class="btn btn-danger" onclick="submitAppReturn()">
                         <i class="fas fa-times-circle"></i> Return / Incomplete
                     </button>
                 </div>
@@ -222,3 +389,48 @@ $requirement_labels = [
 <?php endif; ?>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+<script>
+function toggleRejectForm(i) {
+    const form = document.getElementById('rejectForm-' + i);
+    form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    if (form.style.display === 'block') {
+        document.getElementById('remarks-' + i).focus();
+    }
+}
+
+function validateRemarks(i) {
+    const remarks = document.getElementById('remarks-' + i);
+    if (!remarks.value.trim()) {
+        remarks.style.borderColor = 'var(--danger)';
+        remarks.placeholder = 'Remarks are required for rejection.';
+        remarks.focus();
+        return false;
+    }
+    return true;
+}
+
+function submitAppReturn() {
+    const feedback = document.getElementById('appFeedback');
+    if (!feedback.value.trim()) {
+        feedback.style.borderColor = 'var(--danger)';
+        feedback.placeholder = 'Remarks are required when returning an application.';
+        feedback.focus();
+        let msg = document.getElementById('appFeedbackError');
+        if (!msg) {
+            msg = document.createElement('p');
+            msg.id = 'appFeedbackError';
+            msg.style.cssText = 'color:var(--danger);font-size:0.82rem;margin-top:4px;';
+            msg.textContent = 'Please provide remarks explaining why the application is being returned.';
+            feedback.parentNode.appendChild(msg);
+        }
+        return;
+    }
+    // Set hidden input and submit
+    const hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.name = 'verification_status';
+    hidden.value = 'returned';
+    document.getElementById('overallVerifyForm').appendChild(hidden);
+    document.getElementById('overallVerifyForm').submit();
+}
+</script>

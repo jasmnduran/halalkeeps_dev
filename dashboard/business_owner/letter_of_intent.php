@@ -16,6 +16,9 @@ $success = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $company_name = sanitize($_POST['company_name'] ?? '');
     $company_address = sanitize($_POST['company_address'] ?? '');
+    $enterprise_type = sanitize($_POST['enterprise_type'] ?? '');
+    $application_type = sanitize($_POST['application_type'] ?? '');
+    $certifying_body = sanitize($_POST['certifying_body'] ?? 'HDIP');
     $date_of_intent = sanitize($_POST['date_of_intent'] ?? '');
     // Build menu_list from dynamic items array
     $menu_items = $_POST['menu_items'] ?? [];
@@ -25,28 +28,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $contact_email = sanitize($_POST['contact_email'] ?? '');
     $contact_phone = sanitize($_POST['contact_phone'] ?? '');
     $submit_action = $_POST['submit_action'] ?? 'draft';
+    // Signature — raw base64 data URL, not run through sanitize (it strips special chars)
+    $signature_data = $_POST['signature_data'] ?? '';
+    // Validate it's a proper PNG data URL
+    if ($signature_data && !preg_match('/^data:image\/png;base64,/', $signature_data)) {
+        $signature_data = '';
+    }
     
     if (empty($company_name)) {
         $error = 'Company name is required.';
+    } elseif ($submit_action === 'submit' && empty($signature_data)) {
+        $error = 'Please sign the letter before submitting.';
     } else {
         $status = ($submit_action === 'submit') ? 'submitted' : 'draft';
         $submitted_at = ($submit_action === 'submit') ? date('Y-m-d H:i:s') : null;
         
         if (isset($_POST['loi_id']) && $_POST['loi_id'] > 0) {
+            // Check previous status before updating
+            $prev_stmt = $conn->prepare("SELECT status FROM letter_of_intent WHERE id = ? AND business_owner_id = ?");
+            $prev_stmt->bind_param("ii", $_POST['loi_id'], $user_id);
+            $prev_stmt->execute();
+            $prev_row = $prev_stmt->get_result()->fetch_assoc();
+            $was_returned = ($prev_row && $prev_row['status'] === 'returned');
+
             // Update existing
-            $stmt = $conn->prepare("UPDATE letter_of_intent SET company_name=?, company_address=?, menu_list=?, contact_person=?, contact_email=?, contact_phone=?, status=?, submitted_at=COALESCE(?, submitted_at), date_of_intent=? WHERE id=? AND business_owner_id=?");
+            $stmt = $conn->prepare("UPDATE letter_of_intent SET company_name=?, company_address=?, enterprise_type=?, application_type=?, certifying_body=?, menu_list=?, contact_person=?, contact_email=?, contact_phone=?, status=?, submitted_at=COALESCE(?, submitted_at), date_of_intent=?, signature_data=COALESCE(NULLIF(?,  ''), signature_data) WHERE id=? AND business_owner_id=?");
             if (!$stmt) { $error = 'DB error: ' . $conn->error; } else {
-            $stmt->bind_param("sssssssssii", $company_name, $company_address, $menu_list, $contact_person, $contact_email, $contact_phone, $status, $submitted_at, $date_of_intent, $_POST['loi_id'], $user_id);
+            $stmt->bind_param("sssssssssssssii", $company_name, $company_address, $enterprise_type, $application_type, $certifying_body, $menu_list, $contact_person, $contact_email, $contact_phone, $status, $submitted_at, $date_of_intent, $signature_data, $_POST['loi_id'], $user_id);
             
             if ($stmt->execute()) {
                 $success = $submit_action === 'submit' ? 'Letter of Intent submitted successfully!' : 'Draft saved.';
                 if ($submit_action === 'submit') {
-                    // Notify evaluators
                     $eval_query = $conn->query("SELECT id FROM users WHERE role_id = " . ROLE_EVALUATOR . " AND role_status = 'approved'");
                     while ($eval = $eval_query->fetch_assoc()) {
-                        createNotification($conn, $eval['id'], 'New Letter of Intent', 
-                            $_SESSION['full_name'] . ' has submitted a Letter of Intent for ' . $company_name,
-                            'action_required', BASE_URL . 'dashboard/evaluator/verify_loi.php');
+                        if ($was_returned) {
+                            createNotification($conn, $eval['id'], 'LOI Revised & Resubmitted',
+                                $_SESSION['full_name'] . ' has revised and resubmitted their Letter of Intent for ' . $company_name . ' based on your feedback.',
+                                'action_required', BASE_URL . 'dashboard/evaluator/verify_loi.php?action=review&id=' . $_POST['loi_id']);
+                        } else {
+                            createNotification($conn, $eval['id'], 'New Letter of Intent',
+                                $_SESSION['full_name'] . ' has submitted a Letter of Intent for ' . $company_name,
+                                'action_required', BASE_URL . 'dashboard/evaluator/verify_loi.php');
+                        }
                     }
                 }
                 $action = 'list';
@@ -56,8 +79,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } // end if $stmt
         } else {
             // Insert new
-            $stmt = $conn->prepare("INSERT INTO letter_of_intent (business_owner_id, company_name, company_address, menu_list, contact_person, contact_email, contact_phone, status, submitted_at, date_of_intent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-            $stmt->bind_param("isssssssss", $user_id, $company_name, $company_address, $menu_list, $contact_person, $contact_email, $contact_phone, $status, $submitted_at, $date_of_intent);
+            $stmt = $conn->prepare("INSERT INTO letter_of_intent (business_owner_id, company_name, company_address, enterprise_type, application_type, certifying_body, menu_list, contact_person, contact_email, contact_phone, status, submitted_at, date_of_intent, signature_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            if (!$stmt) { $error = 'DB error: ' . $conn->error; } else {
+            $stmt->bind_param("iissssssssssss", $user_id, $company_name, $company_address, $enterprise_type, $application_type, $certifying_body, $menu_list, $contact_person, $contact_email, $contact_phone, $status, $submitted_at, $date_of_intent, $signature_data);
             
             if ($stmt->execute()) {
                 $success = $submit_action === 'submit' ? 'Letter of Intent submitted successfully!' : 'Draft saved.';
@@ -74,6 +98,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else {
                 $error = 'Failed to create. Please try again.';
             }
+            } // end if $stmt
         }
     }
 }
@@ -100,6 +125,26 @@ if ($action === 'list') {
     $all_lois = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 }
 
+// Check if owner already has an LOI (any status)
+$has_loi = false;
+$loi_check = $conn->prepare("SELECT id FROM letter_of_intent WHERE business_owner_id = ? LIMIT 1");
+$loi_check->bind_param("i", $user_id);
+$loi_check->execute();
+$has_loi = (bool) $loi_check->get_result()->fetch_assoc();
+
+// Check if owner has an active halal certificate awarded by the President
+$has_certificate = false;
+$cert_check = $conn->prepare("SELECT hc.id FROM halal_certificates hc JOIN hdp_applications ha ON hc.application_id = ha.id WHERE ha.business_owner_id = ? AND hc.status IN ('active','awarded') LIMIT 1");
+$cert_check->bind_param("i", $user_id);
+$cert_check->execute();
+$has_certificate = (bool) $cert_check->get_result()->fetch_assoc();
+
+// Block create/select_body if they already have an LOI and no certificate yet
+if (in_array($action, ['create', 'select_body']) && $has_loi && !$has_certificate) {
+    $action = 'list';
+    $error = 'You already have a Letter of Intent. You can only create a new one after receiving your Halal Certificate.';
+}
+
 require_once __DIR__ . '/../../includes/header.php';
 ?>
 
@@ -122,7 +167,7 @@ require_once __DIR__ . '/../../includes/header.php';
                 <div class="empty-icon"><i class="fas fa-file-alt"></i></div>
                 <h3>No Letter of Intent</h3>
                 <p>Create your Letter of Intent to start the halal certification process.</p>
-                <a href="?action=create" class="btn btn-primary"><i class="fas fa-plus"></i> Create LOI</a>
+                <a href="?action=select_body" class="btn btn-primary"><i class="fas fa-plus"></i> Create LOI</a>
             </div>
         <?php else: $loi = $all_lois[0]; ?>
             <div style="padding: 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
@@ -136,7 +181,9 @@ require_once __DIR__ . '/../../includes/header.php';
                     <?= getStatusBadge($loi['status']) ?>
                     <a href="?action=view&id=<?= $loi['id'] ?>" class="btn btn-sm btn-outline"><i class="fas fa-eye"></i> View</a>
                     <?php if (in_array($loi['status'], ['draft', 'returned'])): ?>
-                        <a href="?action=edit&id=<?= $loi['id'] ?>" class="btn btn-sm btn-primary"><i class="fas fa-edit"></i> Edit</a>
+                        <a href="?action=edit&id=<?= $loi['id'] ?>" class="btn btn-sm btn-primary">
+                            <i class="fas fa-edit"></i> <?= $loi['status'] === 'returned' ? 'Edit & Resubmit' : 'Edit' ?>
+                        </a>
                     <?php endif; ?>
                     <?php if ($loi['status'] === 'verified'): ?>
                         <a href="<?= BASE_URL ?>dashboard/business_owner/applications.php?action=create&loi_id=<?= $loi['id'] ?>" class="btn btn-sm btn-success"><i class="fas fa-arrow-right"></i> Proceed</a>
@@ -165,6 +212,13 @@ require_once __DIR__ . '/../../includes/header.php';
 <?php if ($view_loi): ?>
 <a href="?action=list" class="btn btn-outline btn-sm" style="margin-bottom: 20px;"><i class="fas fa-arrow-left"></i> Back to List</a>
 
+<?php if ($view_loi['status'] === 'verified'): ?>
+<a href="<?= BASE_URL ?>dashboard/business_owner/loi_print.php?id=<?= $view_loi['id'] ?>"
+   class="btn btn-success btn-sm" style="margin-bottom: 20px; margin-left: 8px;">
+    <i class="fas fa-file-pdf"></i> Download LOI (PDF)
+</a>
+<?php endif; ?>
+
 <div style="display: grid; grid-template-columns: <?= $req_row ? '1fr 1fr' : '1fr' ?>; gap: 24px; align-items: start;">
 
     <!-- Formal Letter -->
@@ -179,32 +233,45 @@ require_once __DIR__ . '/../../includes/header.php';
             </p>
             <p style="margin-bottom: 24px;">
                 <strong>HADJI ABDULATIF S. SANGCUPAN</strong><br>
-                President/CEO<br>
+                President<br>
                 Halal Development Institute of the Philippines (HDIP)<br>
                 4th Flr. Unit 401, Central Bldg. 37 Arayat Cor. Malabito St.<br>
                 Cubao, Quezon City
             </p>
             <p style="margin-bottom: 24px;">
-                Subject: Letter of Intent for Halal Certification as <strong><?= htmlspecialchars($view_loi['company_name']) ?></strong>
+                Subject: Letter of Intent for Halal Certification — <strong><?= htmlspecialchars($view_loi['company_name']) ?></strong>
+                <?php if (!empty($view_loi['enterprise_type'])): ?>
+                    (<em><?= htmlspecialchars($view_loi['enterprise_type']) ?></em>)
+                <?php endif; ?>
             </p>
-            <p>Dear Sir/Madam,</p>
-            <p>I am writing to formally express the intent of <strong><?= htmlspecialchars($view_loi['company_name']) ?></strong> to apply for Halal Certification from the Halal Development Institute of the Philippines (HDIP) for our products/services.</p>
-            <p>Our company, located at <strong><?= htmlspecialchars($view_loi['company_address']) ?></strong>, produces/serves
+            <p style="margin-bottom: 24px;"> Dear Sir/Madam,</p>
+            <p style="margin-bottom: 24px;"> I am writing to formally express the intent of <strong><?= htmlspecialchars($view_loi['company_name']) ?></strong><?php if (!empty($view_loi['enterprise_type'])): ?>, a <strong><?= htmlspecialchars($view_loi['enterprise_type']) ?></strong>,<?php endif; ?> to apply for <?= !empty($view_loi['application_type']) ? '<strong>' . htmlspecialchars($view_loi['application_type']) . '</strong> of ' : '' ?>Halal Certification from the Halal Development Institute of the Philippines (HDIP) for our products/services.</p>
+            <p style="margin-bottom: 24px;"> Our company, located at <strong><?= htmlspecialchars($view_loi['company_address']) ?></strong>, produces/serves
                 <?php
                     $items = array_filter(explode("\n", $view_loi['menu_list'] ?? ''));
                     echo $items ? '<strong>' . htmlspecialchars(implode(', ', array_map('trim', $items))) . '</strong>' : '<strong>[Specific Product/Menu Item List]</strong>';
                 ?>.
+               
                 We are committed to complying with all the requirements and standards set forth by the HDIP, including adherence to Shariah law, GMP (Good Manufacturing Practices), and hygiene standards.
             </p>
-            <p>We have attached our company profile, product list, and other relevant documents for your preliminary review. We request an assessment of our facility for Halal compliance.</p>
             <p>Thank you for your assistance.</p>
             <p>Sincerely,</p>
             <p style="margin-top: 32px;">
                 <strong><?= htmlspecialchars($view_loi['contact_person'] ?? $_SESSION['full_name']) ?></strong><br>
-                <?= htmlspecialchars($_SESSION['full_name']) ?><br>
                 <?= htmlspecialchars($view_loi['contact_phone'] ?? '[Phone Number]') ?><br>
                 <?= htmlspecialchars($view_loi['contact_email'] ?? $_SESSION['email']) ?>
             </p>
+            <?php if (!empty($view_loi['signature_data'])): ?>
+            <div style="margin-top: 24px; border-top: 1px solid #ddd; padding-top: 16px;">
+                <div style="font-size: 0.8rem; color: #888; margin-bottom: 6px; font-family: Arial, sans-serif;">Applicant's Digital Signature:</div>
+                <img src="<?= htmlspecialchars($view_loi['signature_data']) ?>"
+                     alt="Digital Signature"
+                     style="max-width: 280px; height: auto; border-bottom: 1px solid #333; display: block;">
+                <div style="font-size: 0.75rem; color: #888; margin-top: 4px; font-family: Arial, sans-serif;">
+                    <?= htmlspecialchars($view_loi['contact_person'] ?? $_SESSION['full_name']) ?>
+                </div>
+            </div>
+            <?php endif; ?>
         </div>
     </div>
 
@@ -236,9 +303,9 @@ require_once __DIR__ . '/../../includes/header.php';
 </div>
 
 <?php if ($view_loi['feedback']): ?>
-<div class="alert alert-info" style="margin-top: 20px;">
-    <i class="fas fa-comment"></i>
-    <div>
+<div class="alert <?= $view_loi['status'] === 'returned' ? 'alert-warning' : 'alert-info' ?>" style="margin-top: 20px;">
+    <i class="fas fa-<?= $view_loi['status'] === 'returned' ? 'exclamation-triangle' : 'comment' ?>"></i>
+    <div style="flex: 1;">
         <strong>Evaluator Feedback</strong>
         <p style="margin-top: 4px;"><?= nl2br(htmlspecialchars($view_loi['feedback'])) ?></p>
         <?php if ($view_loi['evaluator_name']): ?>
@@ -248,11 +315,101 @@ require_once __DIR__ . '/../../includes/header.php';
 </div>
 <?php endif; ?>
 
+<?php if ($view_loi['status'] === 'returned'): ?>
+<div style="margin-top: 16px; padding: 20px; background: var(--neutral-50); border: 1px solid var(--neutral-200); border-radius: 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;">
+    <div>
+        <div style="font-weight: 700; color: var(--neutral-800);">Your letter was returned by the evaluator.</div>
+        <div style="font-size: 0.85rem; color: var(--neutral-500); margin-top: 2px;">Please review the feedback above, update your details, and resubmit.</div>
+    </div>
+    <a href="?action=edit&id=<?= $view_loi['id'] ?>" class="btn btn-primary">
+        <i class="fas fa-edit"></i> Edit & Resubmit
+    </a>
+</div>
 <?php endif; ?>
+
+<?php endif; ?>
+
+<?php elseif ($action === 'select_body'): ?>
+<!-- Certifying Body Selection -->
+<a href="?action=list" class="btn btn-outline btn-sm" style="margin-bottom: 20px;"><i class="fas fa-arrow-left"></i> Back</a>
+
+<div style="text-align: center; margin-bottom: 32px;">
+    <h2 style="font-family: var(--font-display); font-weight: 800; color: var(--neutral-900); margin-bottom: 8px;">Choose a Halal Certifying Body</h2>
+    <p style="color: var(--neutral-500);">Select the certifying body you wish to apply with.</p>
+</div>
+
+<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; max-width: 900px; margin: 0 auto;">
+
+    <!-- HDIP — Available -->
+    <a href="?action=create&body=HDIP" style="text-decoration: none;">
+        <div style="background: white; border: 2px solid var(--primary-400); border-radius: 20px; padding: 32px 24px; text-align: center; cursor: pointer; transition: all .2s; box-shadow: 0 4px 20px rgba(0,0,0,0.06);"
+             onmouseover="this.style.transform='translateY(-4px)';this.style.boxShadow='0 12px 32px rgba(0,0,0,0.12)'"
+             onmouseout="this.style.transform='';this.style.boxShadow='0 4px 20px rgba(0,0,0,0.06)'">
+            <!-- HDIP logo as SVG/text since no image file -->
+            <div style="width: 100px; height: 100px; border-radius: 50%; border: 3px solid #111; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 0 auto 16px; background: white; position: relative;">
+                <div style="font-size: 0.55rem; font-weight: 800; letter-spacing: 2px; color: #111; text-align: center; line-height: 1.2;">PHILIPPINES</div>
+                <div style="font-size: 1.6rem; font-family: 'Times New Roman', serif; color: #111; line-height: 1;">حلال</div>
+                <div style="font-size: 0.6rem; color: #111; margin-top: 2px;">Halal</div>
+                <div style="position: absolute; bottom: -14px; background: white; border: 2px solid #111; padding: 2px 10px; font-size: 0.6rem; font-weight: 800; letter-spacing: 2px; color: #111;">HDIP</div>
+            </div>
+            <div style="margin-top: 20px;">
+                <div style="font-weight: 700; font-size: 0.95rem; color: var(--neutral-900); margin-bottom: 4px;">Halal Development Institute of the Philippines</div>
+                <div style="font-size: 0.8rem; color: var(--neutral-500); margin-bottom: 12px;">(HDIP)</div>
+                <span style="background: var(--primary-100); color: var(--primary-700); font-size: 0.75rem; font-weight: 600; padding: 4px 12px; border-radius: 99px;">
+                    <i class="fas fa-check-circle"></i> Available
+                </span>
+            </div>
+        </div>
+    </a>
+
+    <!-- MinHA — Coming Soon -->
+    <div style="background: white; border: 2px solid var(--neutral-200); border-radius: 20px; padding: 32px 24px; text-align: center; opacity: 0.65; position: relative; overflow: hidden;">
+        <div style="position: absolute; top: 14px; right: 14px; background: var(--neutral-200); color: var(--neutral-500); font-size: 0.7rem; font-weight: 700; padding: 3px 10px; border-radius: 99px; text-transform: uppercase; letter-spacing: 1px;">Coming Soon</div>
+        <!-- MinHA logo representation -->
+        <div style="width: 100px; height: 100px; border-radius: 8px; border: 3px solid #2d7a2d; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 0 auto 16px; background: white; overflow: hidden;">
+            <div style="background: #2d7a2d; width: 100%; text-align: center; padding: 4px 0; font-size: 0.65rem; font-weight: 800; color: white; letter-spacing: 1px;">HALAL</div>
+            <div style="flex: 1; display: flex; align-items: center; justify-content: center; position: relative; width: 100%;">
+                <div style="font-size: 1.5rem; font-family: 'Times New Roman', serif; color: #111; z-index: 1;">حلال</div>
+                <div style="position: absolute; left: 8px; top: 50%; transform: translateY(-50%); font-size: 1.8rem; color: #e6c800; line-height: 1;">☽</div>
+            </div>
+            <div style="background: #e6c800; width: 100%; text-align: center; padding: 4px 0; font-size: 0.6rem; font-weight: 800; color: #111;">Philippines</div>
+        </div>
+        <div style="font-weight: 700; font-size: 0.95rem; color: var(--neutral-700); margin-bottom: 4px;">Mindanao Halal Authority</div>
+        <div style="font-size: 0.8rem; color: var(--neutral-400);">(MinHA)</div>
+    </div>
+
+    <!-- MMHCBI — Coming Soon -->
+    <div style="background: white; border: 2px solid var(--neutral-200); border-radius: 20px; padding: 32px 24px; text-align: center; opacity: 0.65; position: relative; overflow: hidden;">
+        <div style="position: absolute; top: 14px; right: 14px; background: var(--neutral-200); color: var(--neutral-500); font-size: 0.7rem; font-weight: 700; padding: 3px 10px; border-radius: 99px; text-transform: uppercase; letter-spacing: 1px;">Coming Soon</div>
+        <!-- MMHCBI logo representation -->
+        <div style="width: 100px; height: 100px; border-radius: 50%; border: 3px solid #2d7a2d; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 0 auto 16px; background: white; position: relative;">
+            <div style="font-size: 0.45rem; font-weight: 700; color: #2d7a2d; text-align: center; line-height: 1.3; padding: 0 6px;">Muslim Mindanao Halal Certification Board</div>
+            <div style="font-size: 1.4rem; font-family: 'Times New Roman', serif; color: #2d7a2d; line-height: 1; margin: 2px 0;">حلال</div>
+            <div style="font-size: 0.65rem; font-weight: 800; color: #2d7a2d; letter-spacing: 1px;">HALAL</div>
+            <div style="position: absolute; bottom: 6px; font-size: 0.45rem; color: #2d7a2d;">★ Philippines ★</div>
+        </div>
+        <div style="font-weight: 700; font-size: 0.95rem; color: var(--neutral-700); margin-bottom: 4px;">Muslim Mindanao Halal Certificate Board, Inc.</div>
+        <div style="font-size: 0.8rem; color: var(--neutral-400);">(MMHCBI)</div>
+    </div>
+
+</div>
 
 <?php elseif ($action === 'create' || $action === 'edit'): ?>
 <!-- Create/Edit LOI Form -->
-<a href="?action=list" class="btn btn-outline btn-sm" style="margin-bottom: 20px;"><i class="fas fa-arrow-left"></i> Back to List</a>
+<a href="<?= $action === 'create' ? '?action=select_body' : '?action=list' ?>" class="btn btn-outline btn-sm" style="margin-bottom: 20px;"><i class="fas fa-arrow-left"></i> <?= $action === 'create' ? 'Back to Selection' : 'Back to List' ?></a>
+
+<?php $selected_body = $_GET['body'] ?? $edit_loi['certifying_body'] ?? 'HDIP'; ?>
+
+<div style="display: flex; align-items: center; gap: 14px; background: var(--primary-50); border: 1px solid var(--primary-200); border-radius: 14px; padding: 14px 20px; margin-bottom: 24px;">
+    <div style="width: 44px; height: 44px; border-radius: 50%; border: 2px solid #111; display: flex; flex-direction: column; align-items: center; justify-content: center; background: white; flex-shrink: 0;">
+        <div style="font-size: 0.9rem; font-family: 'Times New Roman', serif; color: #111; line-height: 1;">حلال</div>
+        <div style="font-size: 0.35rem; font-weight: 800; letter-spacing: 1px; color: #111;">HDIP</div>
+    </div>
+    <div>
+        <div style="font-weight: 700; color: var(--primary-800); font-size: 0.95rem;">Halal Development Institute of the Philippines (HDIP)</div>
+        <div style="font-size: 0.8rem; color: var(--primary-600);">Selected certifying body</div>
+    </div>
+</div>
 
 <div class="card">
     <div class="card-header">
@@ -263,19 +420,33 @@ require_once __DIR__ . '/../../includes/header.php';
             <?php if ($edit_loi): ?>
                 <input type="hidden" name="loi_id" value="<?= $edit_loi['id'] ?>">
             <?php endif; ?>
+            <input type="hidden" name="certifying_body" value="<?= htmlspecialchars($selected_body) ?>">
             
             <h4 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 16px; color: var(--neutral-700);">
                 <i class="fas fa-building" style="color: var(--primary-500);"></i> Company Information
             </h4>
             
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 20px;">
                 <div class="form-group">
                     <label>Company Name <span class="required">*</span></label>
                     <input type="text" name="company_name" class="form-control" value="<?= htmlspecialchars($edit_loi['company_name'] ?? '') ?>" required placeholder="Enter company name">
                 </div>
                 <div class="form-group">
-                    <label>Contact Person</label>
-                    <input type="text" name="contact_person" class="form-control" value="<?= htmlspecialchars($edit_loi['contact_person'] ?? $_SESSION['full_name']) ?>" placeholder="Contact person name">
+                    <label>Enterprise Type <span class="required">*</span></label>
+                    <select name="enterprise_type" class="form-control" required>
+                        <option value="">Select type...</option>
+                        <option value="Micro Enterprise" <?= ($edit_loi['enterprise_type'] ?? '') === 'Micro Enterprise' ? 'selected' : '' ?>>Micro Enterprise</option>
+                        <option value="Small Enterprise" <?= ($edit_loi['enterprise_type'] ?? '') === 'Small Enterprise' ? 'selected' : '' ?>>Small Enterprise</option>
+                        <option value="Medium Enterprise" <?= ($edit_loi['enterprise_type'] ?? '') === 'Medium Enterprise' ? 'selected' : '' ?>>Medium Enterprise</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Application Type <span class="required">*</span></label>
+                    <select name="application_type" class="form-control" required>
+                        <option value="">Select...</option>
+                        <option value="Initial Application" <?= ($edit_loi['application_type'] ?? '') === 'Initial Application' ? 'selected' : '' ?>>Initial Application</option>
+                        <option value="Renewal" <?= ($edit_loi['application_type'] ?? '') === 'Renewal' ? 'selected' : '' ?>>Renewal</option>
+                    </select>
                 </div>
                 <div class="form-group">
                     <label>Date of Intent <span class="required">*</span></label>
@@ -283,9 +454,15 @@ require_once __DIR__ . '/../../includes/header.php';
                 </div>
             </div>
             
-            <div class="form-group">
-                <label>Company Address <span class="required">*</span></label>
-                <textarea name="company_address" class="form-control" rows="2" required placeholder="Complete company address"><?= htmlspecialchars($edit_loi['company_address'] ?? '') ?></textarea>
+            <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 20px;">
+                <div class="form-group">
+                    <label>Company Address <span class="required">*</span></label>
+                    <textarea name="company_address" class="form-control" rows="2" required placeholder="Complete company address"><?= htmlspecialchars($edit_loi['company_address'] ?? '') ?></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Contact Person</label>
+                    <input type="text" name="contact_person" class="form-control" value="<?= htmlspecialchars($edit_loi['contact_person'] ?? $_SESSION['full_name']) ?>" placeholder="Contact person name">
+                </div>
             </div>
             
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
@@ -323,10 +500,45 @@ require_once __DIR__ . '/../../includes/header.php';
                 <p class="form-text">List all menu items or products you want to certify as halal.</p>
             </div>
             
+            <!-- Digital Signature -->
+            <div class="form-group" style="margin-top: 24px;">
+                <label style="font-weight: 600; color: var(--neutral-700); display: block; margin-bottom: 8px;">
+                    <i class="fas fa-signature" style="color: var(--primary-500); margin-right: 6px;"></i>
+                    Digital Signature <span class="required">*</span>
+                </label>
+                <p style="font-size: 0.85rem; color: var(--neutral-500); margin-bottom: 10px;">
+                    Sign below using your mouse or touchscreen. This signature will appear on your Letter of Intent.
+                </p>
+                <div style="border: 2px dashed var(--neutral-300); border-radius: 12px; background: #fafafa; position: relative; overflow: hidden;">
+                    <canvas id="signatureCanvas" width="700" height="160"
+                        style="display: block; width: 100%; height: 160px; cursor: crosshair; touch-action: none;"></canvas>
+                    <?php if (!empty($edit_loi['signature_data'])): ?>
+                    <div id="existingSigNote" style="position: absolute; top: 8px; right: 12px; font-size: 0.75rem; color: var(--primary-600); background: var(--primary-50); padding: 3px 10px; border-radius: 99px;">
+                        <i class="fas fa-check-circle"></i> Signature on file — redraw to replace
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <div style="display: flex; gap: 8px; margin-top: 8px; align-items: center;">
+                    <button type="button" class="btn btn-sm btn-outline" onclick="clearSignature()">
+                        <i class="fas fa-eraser"></i> Clear
+                    </button>
+                    <label class="btn btn-sm btn-outline" style="cursor:pointer; margin: 0;">
+                        <i class="fas fa-upload"></i> Upload Signature
+                        <input type="file" id="sigUploadInput" accept="image/png,image/jpeg,image/jpg"
+                               style="display:none;">
+                    </label>
+                    <span id="sigStatus" style="font-size: 0.8rem; color: var(--neutral-400);">
+                        <?= !empty($edit_loi['signature_data']) ? '<span style="color:var(--primary-600)"><i class="fas fa-check-circle"></i> Signature saved</span>' : 'No signature yet' ?>
+                    </span>
+                </div>
+                <input type="hidden" name="signature_data" id="signatureData"
+                    value="<?= htmlspecialchars($edit_loi['signature_data'] ?? '') ?>">
+            </div>
+
             <div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px;">
                 <a href="?action=list" class="btn btn-secondary"><i class="fas fa-times"></i> Cancel</a>
                 <button type="submit" name="submit_action" value="draft" class="btn btn-outline"><i class="fas fa-save"></i> Save as Draft</button>
-                <button type="submit" name="submit_action" value="submit" class="btn btn-primary"><i class="fas fa-paper-plane"></i> Submit LOI</button>
+                <button type="submit" name="submit_action" value="submit" class="btn btn-primary" id="submitBtn"><i class="fas fa-paper-plane"></i> Submit LOI</button>
             </div>
         </form>
     </div>
@@ -335,6 +547,7 @@ require_once __DIR__ . '/../../includes/header.php';
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
 <script>
+// ── Menu Items ─────────────────────────────────────────────
 function addMenuItem() {
     const container = document.getElementById('menuItemsContainer');
     const row = document.createElement('div');
@@ -354,4 +567,122 @@ function removeMenuItem(btn) {
         btn.closest('.menu-item-row').querySelector('input').value = '';
     }
 }
+
+// ── Signature Pad ──────────────────────────────────────────
+(function () {
+    const canvas = document.getElementById('signatureCanvas');
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    const input = document.getElementById('signatureData');
+    const status = document.getElementById('sigStatus');
+    let drawing = false;
+    let hasSig = input.value.length > 0;
+
+    function resizeCanvas() {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width  = rect.width  * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+        ctx.strokeStyle = '#1a1a2e';
+        ctx.lineWidth   = 2.2;
+        ctx.lineCap     = 'round';
+        ctx.lineJoin    = 'round';
+        if (hasSig && input.value && input.value.startsWith('data:')) {
+            const img = new Image();
+            img.onload = () => ctx.drawImage(img, 0, 0, rect.width, rect.height);
+            img.src = input.value;
+        }
+    }
+    resizeCanvas();
+
+    function getPos(e) {
+        const rect = canvas.getBoundingClientRect();
+        const src  = e.touches ? e.touches[0] : e;
+        return { x: src.clientX - rect.left, y: src.clientY - rect.top };
+    }
+    function startDraw(e) {
+        e.preventDefault();
+        drawing = true;
+        const p = getPos(e);
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+    }
+    function draw(e) {
+        if (!drawing) return;
+        e.preventDefault();
+        const p = getPos(e);
+        ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+    }
+    function endDraw() {
+        if (!drawing) return;
+        drawing = false;
+        input.value = canvas.toDataURL('image/png');
+        hasSig = true;
+        setStatus('<i class="fas fa-check-circle"></i> Signature captured');
+        const note = document.getElementById('existingSigNote');
+        if (note) note.remove();
+    }
+
+    canvas.addEventListener('mousedown',  startDraw);
+    canvas.addEventListener('mousemove',  draw);
+    canvas.addEventListener('mouseup',    endDraw);
+    canvas.addEventListener('mouseleave', endDraw);
+    canvas.addEventListener('touchstart', startDraw, { passive: false });
+    canvas.addEventListener('touchmove',  draw,      { passive: false });
+    canvas.addEventListener('touchend',   endDraw);
+
+    // ── Upload signature image ─────────────────────────────
+    const uploadInput = document.getElementById('sigUploadInput');
+    if (uploadInput) {
+        uploadInput.addEventListener('change', function () {
+            const file = this.files[0];
+            if (!file) return;
+            if (!file.type.match(/image\/(png|jpeg|jpg)/)) {
+                alert('Please upload a PNG or JPG image.');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = function (e) {
+                const img = new Image();
+                img.onload = function () {
+                    const rect = canvas.getBoundingClientRect();
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    // Scale image to fit canvas height, centered
+                    const scale = Math.min(rect.width / img.width, rect.height / img.height);
+                    const w = img.width * scale;
+                    const h = img.height * scale;
+                    const x = (rect.width - w) / 2;
+                    const y = (rect.height - h) / 2;
+                    ctx.drawImage(img, x, y, w, h);
+                    input.value = canvas.toDataURL('image/png');
+                    hasSig = true;
+                    setStatus('<i class="fas fa-check-circle"></i> Signature uploaded');
+                    const note = document.getElementById('existingSigNote');
+                    if (note) note.remove();
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+    }
+
+    function setStatus(html) {
+        if (status) status.innerHTML = '<span style="color:var(--primary-600)">' + html + '</span>';
+    }
+})();
+
+window.clearSignature = function () {
+    const canvas = document.getElementById('signatureCanvas');
+    const input  = document.getElementById('signatureData');
+    const status = document.getElementById('sigStatus');
+    const upload = document.getElementById('sigUploadInput');
+    if (!canvas) return;
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    input.value = '';
+    if (upload) upload.value = '';
+    if (status) status.innerHTML = 'No signature yet';
+};
 </script>

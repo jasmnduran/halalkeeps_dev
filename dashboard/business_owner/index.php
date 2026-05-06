@@ -44,6 +44,15 @@ $apps = $recent_apps->get_result()->fetch_all(MYSQLI_ASSOC);
 // Get notifications
 $notifications = getNotifications($conn, $user_id, 5);
 
+// Check if owner can create a new LOI
+$can_create_loi = ($total_lois === 0);
+if (!$can_create_loi) {
+    $cert_q = $conn->prepare("SELECT hc.id FROM halal_certificates hc JOIN hdp_applications ha ON hc.application_id = ha.id WHERE ha.business_owner_id = ? AND hc.status IN ('active','awarded') LIMIT 1");
+    $cert_q->bind_param("i", $user_id);
+    $cert_q->execute();
+    $can_create_loi = (bool) $cert_q->get_result()->fetch_assoc();
+}
+
 require_once __DIR__ . '/../../includes/header.php';
 ?>
 
@@ -74,9 +83,15 @@ require_once __DIR__ . '/../../includes/header.php';
 <!-- Quick Actions -->
 <div class="card" style="margin-bottom: 24px;">
     <div class="card-body" style="display: flex; gap: 12px; flex-wrap: wrap;">
-        <a href="<?= BASE_URL ?>dashboard/business_owner/letter_of_intent.php?action=create" class="btn btn-primary">
+        <?php if ($can_create_loi): ?>
+        <a href="<?= BASE_URL ?>dashboard/business_owner/letter_of_intent.php?action=select_body" class="btn btn-primary">
             <i class="fas fa-plus"></i> New Letter of Intent
         </a>
+        <?php else: ?>
+        <a href="<?= BASE_URL ?>dashboard/business_owner/letter_of_intent.php" class="btn btn-outline">
+            <i class="fas fa-file-alt"></i> View Letter of Intent
+        </a>
+        <?php endif; ?>
         <a href="<?= BASE_URL ?>dashboard/business_owner/applications.php" class="btn btn-outline">
             <i class="fas fa-clipboard-list"></i> View Applications
         </a>
@@ -102,9 +117,11 @@ require_once __DIR__ . '/../../includes/header.php';
                     <div class="empty-icon"><i class="fas fa-file-alt"></i></div>
                     <h3>No Letters of Intent Yet</h3>
                     <p>Start your halal certification journey by creating a Letter of Intent.</p>
-                    <a href="<?= BASE_URL ?>dashboard/business_owner/letter_of_intent.php?action=create" class="btn btn-primary">
+                    <?php if ($can_create_loi): ?>
+                    <a href="<?= BASE_URL ?>dashboard/business_owner/letter_of_intent.php?action=select_body" class="btn btn-primary">
                         <i class="fas fa-plus"></i> Create LOI
                     </a>
+                    <?php endif; ?>
                 </div>
             <?php else: ?>
                 <div class="table-responsive">

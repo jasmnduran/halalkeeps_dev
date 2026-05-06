@@ -107,8 +107,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_requirement'])
             $ins = $conn->prepare("INSERT INTO application_requirement_uploads (application_id, requirement_label, file_path) VALUES (?, ?, ?)");
             $ins->bind_param("iss", $app_id, $label, $upload['path']);
             $ins->execute();
-            $success = 'File uploaded for: ' . $label;
-        } else {
+
+            // Clear any previous rejection review so evaluator can re-review
+            $clr = $conn->prepare("DELETE FROM application_requirement_reviews WHERE application_id = ? AND requirement_label = ? AND review_status = 'rejected'");
+            $clr->bind_param("is", $app_id, $label);
+            $clr->execute();
+
+            $success = 'File uploaded for: ' . $label;        } else {
             $error = $upload['message'];
         }
     } else {
@@ -116,25 +121,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_requirement'])
     }
 }
 
+// Handle resubmission after fixing rejected files
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resubmit_application']) && $application) {
+    $app_id = intval($application['id']);
+
+    // Make sure no files are still in rejected state
+    $rej_check = $conn->prepare("SELECT COUNT(*) as c FROM application_requirement_reviews WHERE application_id = ? AND review_status = 'rejected'");
+    $rej_check->bind_param("i", $app_id);
+    $rej_check->execute();
+    $still_rejected = $rej_check->get_result()->fetch_assoc()['c'];
+
+    if ($still_rejected > 0) {
+        $error = 'Please re-upload all rejected files before resubmitting.';
+    } else {
+        $upd = $conn->prepare("UPDATE hdp_applications SET status = 'submitted', submitted_at = NOW() WHERE id = ? AND business_owner_id = ?");
+        $upd->bind_param("ii", $app_id, $user_id);
+        if ($upd->execute()) {
+            $eval_query = $conn->query("SELECT id FROM users WHERE role_id = " . ROLE_EVALUATOR . " AND role_status = 'approved'");
+            while ($eval = $eval_query->fetch_assoc()) {
+                createNotification($conn, $eval['id'], 'Application Revised & Resubmitted',
+                    $_SESSION['full_name'] . ' has revised and resubmitted their HDP application after addressing the evaluator\'s feedback.',
+                    'action_required', BASE_URL . 'dashboard/evaluator/verify_applications.php');
+            }
+            $success = 'Application resubmitted successfully!';
+            $app_stmt3 = $conn->prepare("SELECT * FROM hdp_applications WHERE id = ?");
+            $app_stmt3->bind_param("i", $app_id);
+            $app_stmt3->execute();
+            $application = $app_stmt3->get_result()->fetch_assoc();
+        }
+    }
+}
+
 // Handle final submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_application']) && $application) {
     $app_id = intval($application['id']);
-    $upd = $conn->prepare("UPDATE hdp_applications SET status = 'submitted', submitted_at = NOW() WHERE id = ? AND business_owner_id = ?");
-    $upd->bind_param("ii", $app_id, $user_id);
-    if ($upd->execute()) {
-        // Notify evaluators
-        $eval_query = $conn->query("SELECT id FROM users WHERE role_id = " . ROLE_EVALUATOR . " AND role_status = 'approved'");
-        while ($eval = $eval_query->fetch_assoc()) {
-            createNotification($conn, $eval['id'], 'New HDP Application',
-                $_SESSION['full_name'] . ' has submitted an HDP application.',
-                'action_required', BASE_URL . 'dashboard/evaluator/verify_applications.php');
+
+    // Count uploaded files for this application
+    $count_stmt = $conn->prepare("SELECT COUNT(*) as c FROM application_requirement_uploads WHERE application_id = ?");
+    $count_stmt->bind_param("i", $app_id);
+    $count_stmt->execute();
+    $uploaded_count_check = $count_stmt->get_result()->fetch_assoc()['c'];
+    $total_required = 18; // 18 requirement items
+
+    if ($uploaded_count_check < $total_required) {
+        $missing = $total_required - $uploaded_count_check;
+        $error = 'You must upload all ' . $total_required . ' required documents before submitting. ' . $missing . ' file(s) still missing.';
+    } else {
+        $upd = $conn->prepare("UPDATE hdp_applications SET status = 'submitted', submitted_at = NOW() WHERE id = ? AND business_owner_id = ?");
+        $upd->bind_param("ii", $app_id, $user_id);
+        if ($upd->execute()) {
+            // Notify evaluators
+            $eval_query = $conn->query("SELECT id FROM users WHERE role_id = " . ROLE_EVALUATOR . " AND role_status = 'approved'");
+            while ($eval = $eval_query->fetch_assoc()) {
+                createNotification($conn, $eval['id'], 'New HDP Application',
+                    $_SESSION['full_name'] . ' has submitted an HDP application.',
+                    'action_required', BASE_URL . 'dashboard/evaluator/verify_applications.php');
+            }
+            $success = 'Application submitted successfully!';
+            // Refresh
+            $app_stmt3 = $conn->prepare("SELECT * FROM hdp_applications WHERE id = ?");
+            $app_stmt3->bind_param("i", $app_id);
+            $app_stmt3->execute();
+            $application = $app_stmt3->get_result()->fetch_assoc();
         }
-        $success = 'Application submitted successfully!';
-        // Refresh
-        $app_stmt3 = $conn->prepare("SELECT * FROM hdp_applications WHERE id = ?");
-        $app_stmt3->bind_param("i", $app_id);
-        $app_stmt3->execute();
-        $application = $app_stmt3->get_result()->fetch_assoc();
     }
 }
 
@@ -149,10 +198,30 @@ if ($application) {
     }
 }
 
-// Load TOR for this application if any
+// Load evaluator file reviews
+$file_reviews = [];
+if ($application) {
+    $rv = $conn->prepare("SELECT * FROM application_requirement_reviews WHERE application_id = ?");
+    $rv->bind_param("i", $application['id']);
+    $rv->execute();
+    foreach ($rv->get_result()->fetch_all(MYSQLI_ASSOC) as $row) {
+        $file_reviews[$row['requirement_label']] = $row;
+    }
+}
+
+// Load latest overall evaluator feedback
+$evaluator_feedback = null;
+if ($application) {
+    $ef = $conn->prepare("SELECT av.*, u.full_name as evaluator_name FROM application_verification av JOIN users u ON av.evaluator_id = u.id WHERE av.application_id = ? ORDER BY av.verified_at DESC LIMIT 1");
+    $ef->bind_param("i", $application['id']);
+    $ef->execute();
+    $evaluator_feedback = $ef->get_result()->fetch_assoc();
+}
+
+// Check if a TOR exists (for the notification banner)
 $tor = null;
 if ($application) {
-    $tor_q = $conn->prepare("SELECT * FROM terms_of_reference WHERE application_id = ? ORDER BY created_at DESC LIMIT 1");
+    $tor_q = $conn->prepare("SELECT id FROM terms_of_reference WHERE application_id = ? LIMIT 1");
     $tor_q->bind_param("i", $application['id']);
     $tor_q->execute();
     $tor = $tor_q->get_result()->fetch_assoc();
@@ -195,46 +264,77 @@ require_once __DIR__ . '/../../includes/header.php';
                 <thead>
                     <tr>
                         <th style="width: 40%;">Requirement</th>
-                        <th>Uploaded File</th>
-                        <th style="width: 220px;">Upload</th>
+                        <th>File</th>
+                        <th style="width: 140px;">Status</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php foreach ($requirement_labels as $label): ?>
-                    <?php $uploaded = $uploaded_files[$label] ?? null; ?>
+                    <?php
+                        $uploaded = $uploaded_files[$label] ?? null;
+                        $review   = $file_reviews[$label] ?? null;
+                        $is_rejected = $review && $review['review_status'] === 'rejected';
+                        $is_accepted = $review && $review['review_status'] === 'accepted';
+                        $needs_upload = !$uploaded || $is_rejected;
+                        $can_upload = in_array($application['status'], ['draft', 'incomplete']) || $is_rejected;
+                    ?>
                     <tr>
                         <td style="font-size: 0.9rem; color: var(--neutral-700); vertical-align: middle;">
                             <?= htmlspecialchars($label) ?>
                         </td>
+
+                        <!-- File column: upload zone OR view link -->
                         <td style="vertical-align: middle;">
-                            <?php if ($uploaded): ?>
+                            <?php if ($can_upload && $needs_upload): ?>
+                            <form method="POST" enctype="multipart/form-data" class="req-upload-form">
+                                <input type="hidden" name="upload_requirement" value="1">
+                                <input type="hidden" name="requirement_label" value="<?= htmlspecialchars($label) ?>">
+                                <div class="req-dropzone <?= $is_rejected ? 'rejected-dropzone' : '' ?>"
+                                     onclick="this.querySelector('input[type=file]').click()"
+                                     ondragover="event.preventDefault();this.classList.add('drag-over')"
+                                     ondragleave="this.classList.remove('drag-over')"
+                                     ondrop="handleDrop(event,this)">
+                                    <i class="fas fa-cloud-upload-alt" style="font-size:1.4rem;color:<?= $is_rejected ? 'var(--danger)' : 'var(--primary-500)' ?>;margin-bottom:4px;"></i>
+                                    <div style="font-weight:600;font-size:0.78rem;color:var(--neutral-700);">
+                                        <?= $is_rejected ? 'Re-upload file' : 'Click to upload or drag and drop' ?>
+                                    </div>
+                                    <div style="font-size:0.72rem;color:var(--neutral-400);margin-top:2px;">PDF, JPG, PNG (max 5MB)</div>
+                                    <input type="file" name="req_file" accept=".pdf,.png,.jpg,.jpeg"
+                                           style="display:none;" onchange="this.closest('form').submit()">
+                                </div>
+                            </form>
+                            <?php elseif ($uploaded): ?>
                                 <a href="<?= BASE_URL ?>uploads/<?= $uploaded['file_path'] ?>" target="_blank"
                                    style="font-size:0.85rem;color:var(--primary-600);display:inline-flex;align-items:center;gap:6px;">
                                     <i class="fas fa-file"></i> View file
                                 </a>
                                 <br><small style="color:var(--neutral-400);"><?= formatDate($uploaded['uploaded_at']) ?></small>
                             <?php else: ?>
-                                <span style="font-size:0.8rem;color:var(--neutral-400);">Not uploaded</span>
+                                <span style="font-size:0.8rem;color:var(--neutral-300);">—</span>
                             <?php endif; ?>
                         </td>
+
+                        <!-- Status column -->
                         <td style="vertical-align: middle;">
-                            <?php if (in_array($application['status'], ['draft', 'incomplete'])): ?>
-                            <form method="POST" enctype="multipart/form-data" class="req-upload-form">
-                                <input type="hidden" name="upload_requirement" value="1">
-                                <input type="hidden" name="requirement_label" value="<?= htmlspecialchars($label) ?>">
-                                <div class="req-dropzone" onclick="this.querySelector('input[type=file]').click()"
-                                     ondragover="event.preventDefault();this.classList.add('drag-over')"
-                                     ondragleave="this.classList.remove('drag-over')"
-                                     ondrop="handleDrop(event,this)">
-                                    <i class="fas fa-cloud-upload-alt" style="font-size:1.6rem;color:var(--primary-500);margin-bottom:6px;"></i>
-                                    <div style="font-weight:600;font-size:0.8rem;color:var(--neutral-700);">Click to upload or drag and drop</div>
-                                    <div style="font-size:0.75rem;color:var(--neutral-400);margin-top:2px;">PDF, JPG, PNG (max 5MB)</div>
-                                    <input type="file" name="req_file" accept=".pdf,.png,.jpg,.jpeg"
-                                           style="display:none;" onchange="this.closest('form').submit()">
-                                </div>
-                            </form>
+                            <?php if (!$uploaded): ?>
+                                <span style="font-size:0.78rem;color:var(--neutral-300);">—</span>
+                            <?php elseif ($is_accepted): ?>
+                                <span class="badge badge-success" style="font-size:0.75rem;">
+                                    <i class="fas fa-check-circle"></i> Accepted
+                                </span>
+                            <?php elseif ($is_rejected): ?>
+                                <span class="badge badge-danger" style="font-size:0.75rem;">
+                                    <i class="fas fa-times-circle"></i> Rejected
+                                </span>
+                                <?php if ($review['remarks']): ?>
+                                <br><small style="color:var(--danger);font-size:0.75rem;display:block;margin-top:3px;line-height:1.3;">
+                                    <i class="fas fa-comment"></i> <?= htmlspecialchars($review['remarks']) ?>
+                                </small>
+                                <?php endif; ?>
                             <?php else: ?>
-                                <span style="font-size:0.8rem;color:var(--neutral-400);">—</span>
+                                <span class="badge badge-warning" style="font-size:0.75rem;">
+                                    <i class="fas fa-clock"></i> To be evaluated
+                                </span>
                             <?php endif; ?>
                         </td>
                     </tr>
@@ -262,23 +362,68 @@ require_once __DIR__ . '/../../includes/header.php';
                 <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;margin-bottom:6px;">Upload Progress</div>
                 <?php $uploaded_count = count($uploaded_files); $total = count($requirement_labels); ?>
                 <div style="background:var(--neutral-100);border-radius:99px;height:8px;overflow:hidden;">
-                    <div style="background:var(--primary-500);height:100%;width:<?= round($uploaded_count/$total*100) ?>%;transition:width .3s;"></div>
+                    <div style="background:var(--primary-500);height:100%;width:<?= round(count($uploaded_files)/count($requirement_labels)*100) ?>%;transition:width .3s;"></div>
                 </div>
-                <div style="font-size:0.8rem;color:var(--neutral-500);margin-top:4px;"><?= $uploaded_count ?> / <?= $total ?> uploaded</div>
+                <div style="font-size:0.8rem;color:var(--neutral-500);margin-top:4px;"><?= count($uploaded_files) ?> / <?= count($requirement_labels) ?> uploaded</div>
             </div>
 
-            <?php if (in_array($application['status'], ['draft', 'incomplete'])): ?>
-            <form method="POST">
-                <input type="hidden" name="submit_application" value="1">
-                <button type="submit" class="btn btn-primary" style="width:100%;"
-                    onclick="return confirm('Submit your application? Make sure all required files are uploaded.')">
-                    <i class="fas fa-paper-plane"></i> Submit Application
-                </button>
-            </form>
+            <?php if ($evaluator_feedback && $evaluator_feedback['feedback']): ?>
+            <div class="alert <?= $evaluator_feedback['verification_status'] === 'returned' ? 'alert-warning' : 'alert-info' ?>" style="margin-bottom:16px;font-size:0.85rem;">
+                <i class="fas fa-<?= $evaluator_feedback['verification_status'] === 'returned' ? 'exclamation-triangle' : 'comment' ?>"></i>
+                <div>
+                    <strong>Evaluator Remarks</strong>
+                    <p style="margin-top:4px;"><?= nl2br(htmlspecialchars($evaluator_feedback['feedback'])) ?></p>
+                    <small style="color:var(--neutral-400);">By: <?= htmlspecialchars($evaluator_feedback['evaluator_name']) ?> · <?= formatDate($evaluator_feedback['verified_at']) ?></small>
+                </div>
+            </div>
+            <?php endif; ?>
+
+            <?php
+                $uploaded_count = count($uploaded_files);
+                $total = count($requirement_labels);
+                $all_uploaded = ($uploaded_count >= $total);
+                $pending_rejections = count(array_filter($file_reviews, fn($r) => $r['review_status'] === 'rejected'));
+            ?>
+
+            <?php if ($application['status'] === 'draft'): ?>
+                <?php if (!$all_uploaded): ?>
+                <div style="background:var(--neutral-50);border:1px solid var(--neutral-200);border-radius:10px;padding:12px 14px;margin-bottom:12px;font-size:0.85rem;color:var(--neutral-600);">
+                    <i class="fas fa-exclamation-triangle" style="color:var(--accent-500);margin-right:6px;"></i>
+                    Upload all <strong><?= $total ?></strong> required documents to enable submission.
+                    <strong style="color:var(--danger);"><?= $total - $uploaded_count ?> remaining.</strong>
+                </div>
+                <?php endif; ?>
+                <form method="POST">
+                    <input type="hidden" name="submit_application" value="1">
+                    <button type="submit" class="btn btn-primary" style="width:100%;"
+                        <?= !$all_uploaded ? 'disabled title="Upload all required files first"' : '' ?>
+                        <?= $all_uploaded ? 'onclick="return confirm(\'Submit your application? This cannot be undone.\')"' : '' ?>>
+                        <i class="fas fa-paper-plane"></i> Submit Application
+                        <?php if (!$all_uploaded): ?>(<?= $uploaded_count ?>/<?= $total ?>)<?php endif; ?>
+                    </button>
+                </form>
+
+            <?php elseif ($application['status'] === 'incomplete'): ?>
+                <?php if ($pending_rejections > 0): ?>
+                <div style="background:#fff5f5;border:1px solid #fca5a5;border-radius:10px;padding:12px 14px;margin-bottom:12px;font-size:0.85rem;color:var(--neutral-700);">
+                    <i class="fas fa-times-circle" style="color:var(--danger);margin-right:6px;"></i>
+                    Re-upload <strong><?= $pending_rejections ?></strong> rejected file(s) before resubmitting.
+                </div>
+                <?php endif; ?>
+                <form method="POST">
+                    <input type="hidden" name="resubmit_application" value="1">
+                    <button type="submit" class="btn btn-primary" style="width:100%;"
+                        <?= $pending_rejections > 0 ? 'disabled title="Re-upload all rejected files first"' : '' ?>
+                        <?= $pending_rejections === 0 ? 'onclick="return confirm(\'Resubmit your revised application to the evaluator?\')"' : '' ?>>
+                        <i class="fas fa-redo"></i> Resend Application
+                    </button>
+                </form>
+
             <?php elseif ($application['status'] === 'submitted'): ?>
             <div class="alert alert-info" style="margin:0;font-size:0.85rem;">
                 <i class="fas fa-clock"></i> Application submitted on <?= formatDate($application['submitted_at']) ?>. Awaiting review.
             </div>
+
             <?php else: ?>
             <div style="text-align:center;"><?= getStatusBadge($application['status']) ?></div>
             <?php endif; ?>
@@ -289,68 +434,15 @@ require_once __DIR__ . '/../../includes/header.php';
 <?php endif; ?>
 
 <?php if ($tor): ?>
-<!-- Terms of Reference -->
-<div class="card" style="margin-top: 24px;">
-    <div class="card-header">
-        <h3><i class="fas fa-file-contract" style="color:var(--primary-600);margin-right:8px;"></i> Terms of Reference</h3>
-        <?php
-            $resp = $tor['business_response'] ?? 'pending';
-            $badge = ['pending' => 'badge-warning', 'accepted' => 'badge-success', 'rejected' => 'badge-danger'];
-        ?>
-        <span class="badge <?= $badge[$resp] ?>">Your response: <?= ucfirst($resp) ?></span>
-    </div>
-    <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 0;">
-        <!-- TOR Content -->
-        <div style="padding: 32px 40px; border-right: 1px solid var(--neutral-100); white-space: pre-wrap; font-family: 'Times New Roman', serif; font-size: 0.95rem; line-height: 1.8; color: #111; max-height: 500px; overflow-y: auto;">
-            <?= htmlspecialchars($tor['tor_content']) ?>
-        </div>
-        <!-- Response Panel -->
-        <div style="padding: 24px;">
-            <div style="margin-bottom:16px;">
-                <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;">Inspection Fee</div>
-                <div style="font-weight:700;font-size:1.1rem;"><?= formatCurrency($tor['inspection_fees']) ?></div>
-            </div>
-            <div style="margin-bottom:20px;">
-                <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;">Sent On</div>
-                <div><?= formatDate($tor['created_at']) ?></div>
-            </div>
-
-            <?php if ($resp === 'pending'): ?>
-            <form method="POST">
-                <input type="hidden" name="tor_response" value="1">
-                <input type="hidden" name="tor_id" value="<?= $tor['id'] ?>">
-                <div class="form-group">
-                    <label>Remarks <small style="color:var(--neutral-400);">(required if rejecting)</small></label>
-                    <textarea name="business_remarks" class="form-control" rows="4"
-                        placeholder="If you disagree or want to negotiate any terms, explain here..."></textarea>
-                </div>
-                <div style="display:flex;flex-direction:column;gap:10px;margin-top:8px;">
-                    <button type="submit" name="response_action" value="accepted" class="btn btn-success"
-                        onclick="return confirm('Confirm you agree to the Terms of Reference?')">
-                        <i class="fas fa-check-circle"></i> I Agree / Accept
-                    </button>
-                    <button type="submit" name="response_action" value="rejected" class="btn btn-danger">
-                        <i class="fas fa-times-circle"></i> I Disagree / Send Remarks
-                    </button>
-                </div>
-            </form>
-            <?php elseif ($resp === 'accepted'): ?>
-            <div class="alert alert-success" style="margin:0;">
-                <i class="fas fa-check-circle"></i>
-                <span>You have accepted the Terms of Reference on <?= formatDate($tor['responded_at']) ?>.</span>
-            </div>
-            <?php else: ?>
-            <div class="alert alert-warning" style="margin:0 0 12px;">
-                <i class="fas fa-exclamation-triangle"></i>
-                <span>You submitted remarks on <?= formatDate($tor['responded_at']) ?>. Awaiting evaluator response.</span>
-            </div>
-            <?php if ($tor['business_remarks']): ?>
-            <div style="background:var(--neutral-50);padding:12px;border-radius:8px;font-size:0.85rem;color:var(--neutral-700);">
-                <strong>Your remarks:</strong><br><?= nl2br(htmlspecialchars($tor['business_remarks'])) ?>
-            </div>
-            <?php endif; ?>
-            <?php endif; ?>
-        </div>
+<!-- TOR moved to its own page — show a link instead -->
+<div class="alert alert-info" style="margin-top: 24px;">
+    <i class="fas fa-file-contract"></i>
+    <div>
+        <strong>Terms of Reference Available</strong>
+        <p style="margin-top:4px;font-size:0.9rem;">The evaluator has sent you a Terms of Reference. Please review and respond.</p>
+        <a href="<?= BASE_URL ?>dashboard/business_owner/terms_of_reference.php" class="btn btn-sm btn-primary" style="margin-top:8px;">
+            <i class="fas fa-arrow-right"></i> View Terms of Reference
+        </a>
     </div>
 </div>
 <?php endif; ?>
@@ -372,6 +464,14 @@ require_once __DIR__ . '/../../includes/header.php';
 .req-dropzone:hover, .req-dropzone.drag-over {
     border-color: var(--primary-500);
     background: var(--primary-50);
+}
+.req-dropzone.rejected-dropzone {
+    border-color: var(--danger);
+    background: #fff5f5;
+}
+.req-dropzone.rejected-dropzone:hover, .req-dropzone.rejected-dropzone.drag-over {
+    border-color: var(--danger);
+    background: #ffe4e4;
 }
 </style>
 <script>

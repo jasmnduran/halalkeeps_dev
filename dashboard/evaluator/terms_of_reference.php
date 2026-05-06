@@ -77,41 +77,64 @@ Including particular conditions for the assessment of management systems by Hala
 
 // Handle sending TOR
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['send_tor'])) {
-    $app_id  = intval($_POST['application_id']);
+    $app_id      = intval($_POST['application_id']);
     $tor_content = $_POST['tor_content'] ?? $default_tor;
-    $payment = floatval($_POST['payment_for_inspection'] ?? 0);
-    $fees    = floatval($_POST['inspection_fees'] ?? 0);
+    $payment     = floatval($_POST['payment_for_inspection'] ?? 0);
+    $fees        = floatval($_POST['inspection_fees'] ?? 0);
 
-    // Check if TOR already exists for this application
-    $existing = $conn->prepare("SELECT id FROM terms_of_reference WHERE application_id = ?");
-    $existing->bind_param("i", $app_id);
-    $existing->execute();
-    $existing_tor = $existing->get_result()->fetch_assoc();
+    // Handle optional file upload
+    $tor_file_path = '';
+    if (isset($_FILES['tor_file']) && $_FILES['tor_file']['error'] === UPLOAD_ERR_OK) {
+        $upload = uploadFile($_FILES['tor_file'], 'documents', ['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png']);
+        if ($upload['success']) {
+            $tor_file_path = $upload['path'];
+        } else {
+            $error = 'File upload failed: ' . $upload['message'];
+        }
+    }
 
-    if ($existing_tor) {
-        $upd = $conn->prepare("UPDATE terms_of_reference SET tor_content=?, payment_for_inspection=?, inspection_fees=?, status='sent', business_response='pending', responded_at=NULL WHERE application_id=?");
-        $upd->bind_param("sddi", $tor_content, $payment, $fees, $app_id);
-        $upd->execute();
-    } else {
-        $stmt = $conn->prepare("INSERT INTO terms_of_reference (application_id, evaluator_id, tor_content, payment_for_inspection, inspection_fees, status, business_response) VALUES (?, ?, ?, ?, ?, 'sent', 'pending')");
-        $stmt->bind_param("iisdd", $app_id, $user_id, $tor_content, $payment, $fees);
-        $stmt->execute();
+    if (!$error) {
+        // Check if TOR already exists for this application
+        $existing = $conn->prepare("SELECT id, tor_file_path FROM terms_of_reference WHERE application_id = ?");
+        $existing->bind_param("i", $app_id);
+        $existing->execute();
+        $existing_tor = $existing->get_result()->fetch_assoc();
+
+        // Keep old file if no new one uploaded
+        if (empty($tor_file_path) && $existing_tor) {
+            $tor_file_path = $existing_tor['tor_file_path'] ?? '';
+        }
+
+        if ($existing_tor) {
+            $upd = $conn->prepare("UPDATE terms_of_reference SET tor_content=?, payment_for_inspection=?, inspection_fees=?, tor_file_path=?, status='sent', business_response='pending', responded_at=NULL WHERE application_id=?");
+            $upd->bind_param("sddsi", $tor_content, $payment, $fees, $tor_file_path, $app_id);
+            $upd->execute();
+        } else {
+            $stmt = $conn->prepare("INSERT INTO terms_of_reference (application_id, evaluator_id, tor_content, payment_for_inspection, inspection_fees, tor_file_path, status, business_response) VALUES (?, ?, ?, ?, ?, ?, 'sent', 'pending')");
+            $stmt->bind_param("iisdds", $app_id, $user_id, $tor_content, $payment, $fees, $tor_file_path);
+            $stmt->execute();
+        }
     }
 
     $owner_q = $conn->prepare("SELECT business_owner_id FROM hdp_applications WHERE id = ?");
     $owner_q->bind_param("i", $app_id);
     $owner_q->execute();
     $owner = $owner_q->get_result()->fetch_assoc();
-    if ($owner) {
+    if ($owner && !$error) {
+        $is_update = !empty($existing_tor);
         createNotification($conn, $owner['business_owner_id'],
-            'Terms of Reference Sent',
-            'The evaluator has sent you the Terms of Reference for your halal certification. Please review and respond.',
+            $is_update ? 'Terms of Reference Updated' : 'Terms of Reference Sent',
+            $is_update
+                ? 'The evaluator has updated the Terms of Reference for your application. Please review the changes and respond.'
+                : 'The evaluator has sent you the Terms of Reference for your halal certification. Please review and respond.',
             'action_required',
-            BASE_URL . 'dashboard/business_owner/applications.php');
+            BASE_URL . 'dashboard/business_owner/terms_of_reference.php');
     }
-    logActivity($conn, $user_id, 'TOR Sent', 'TOR sent for application #' . $app_id, 'evaluation');
-    $success = 'Terms of Reference sent to business owner.';
-    $action = 'list';
+    if (!$error) {
+        logActivity($conn, $user_id, 'TOR Sent', 'TOR sent for application #' . $app_id, 'evaluation');
+        $success = $existing_tor ? 'Terms of Reference updated and resent.' : 'Terms of Reference sent to business owner.';
+        $action = 'list';
+    }
 }
 
 // Load all TORs with business response
@@ -124,14 +147,31 @@ $all_tors = $conn->query("
     ORDER BY t.created_at DESC
 ")->fetch_all(MYSQLI_ASSOC);
 
-// Load verified apps that don't have a TOR yet (or have one)
-$verified_apps = $conn->query("
+// Apps with no TOR yet
+$apps_without_tor = $conn->query("
     SELECT ha.*, loi.company_name
     FROM hdp_applications ha
     JOIN letter_of_intent loi ON ha.loi_id = loi.id
     WHERE ha.status = 'verified'
+      AND ha.id NOT IN (SELECT application_id FROM terms_of_reference)
     ORDER BY ha.updated_at DESC
 ")->fetch_all(MYSQLI_ASSOC);
+
+// Get TOR for edit action
+$edit_tor = null;
+if ($action === 'edit' && isset($_GET['id'])) {
+    $et = $conn->prepare("SELECT t.*, loi.company_name FROM terms_of_reference t JOIN hdp_applications ha ON t.application_id = ha.id JOIN letter_of_intent loi ON ha.loi_id = loi.id WHERE t.id = ?");
+    $et->bind_param("i", $_GET['id']);
+    $et->execute();
+    $edit_tor = $et->get_result()->fetch_assoc();
+    // Block editing if already accepted
+    if ($edit_tor && ($edit_tor['business_response'] ?? '') === 'accepted') {
+        $action = 'view';
+        $_GET['id'] = $edit_tor['id'];
+        $error = 'This Terms of Reference has been accepted by the business owner and can no longer be edited.';
+        $edit_tor = null;
+    }
+}
 
 require_once __DIR__ . '/../../includes/header.php';
 ?>
@@ -145,28 +185,56 @@ require_once __DIR__ . '/../../includes/header.php';
 
 <?php if ($action === 'list'): ?>
 
-<?php if (!empty($verified_apps)): ?>
+<?php if (!empty($apps_without_tor)): ?>
 <div class="card" style="margin-bottom: 24px;">
     <div class="card-header">
         <h3><i class="fas fa-paper-plane" style="color:var(--primary-600);margin-right:8px;"></i> Send Terms of Reference</h3>
     </div>
     <div class="card-body">
-        <form method="POST">
+        <form method="POST" enctype="multipart/form-data">
             <input type="hidden" name="send_tor" value="1">
             <div class="form-group">
                 <label>Select Verified Application <span class="required">*</span></label>
                 <select name="application_id" class="form-control" required>
                     <option value="">Select application...</option>
-                    <?php foreach ($verified_apps as $va): ?>
+                    <?php foreach ($apps_without_tor as $va): ?>
                     <option value="<?= $va['id'] ?>"><?= htmlspecialchars($va['company_name']) ?></option>
                     <?php endforeach; ?>
                 </select>
             </div>
+
+            <!-- Toggle -->
             <div class="form-group">
+                <label>How would you like to provide the TOR?</label>
+                <div style="display:flex;gap:12px;margin-top:6px;">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal;">
+                        <input type="radio" name="tor_input_mode" value="type" checked onchange="toggleTorMode('type')">
+                        <span>Type / Paste Content</span>
+                    </label>
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal;">
+                        <input type="radio" name="tor_input_mode" value="upload" onchange="toggleTorMode('upload')">
+                        <span>Upload File</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Type mode -->
+            <div id="torTypeMode" class="form-group">
                 <label>Terms of Reference Content</label>
                 <textarea name="tor_content" class="form-control" rows="12" style="font-size:0.85rem;font-family:monospace;"><?= htmlspecialchars($default_tor) ?></textarea>
                 <p class="form-text">You may edit the content before sending.</p>
             </div>
+
+            <!-- Upload mode -->
+            <div id="torUploadMode" class="form-group" style="display:none;">
+                <label>Upload TOR File <span class="required">*</span> <small style="color:var(--neutral-400);">PDF, DOC, DOCX, JPG, PNG</small></label>
+                <div class="file-upload">
+                    <input type="file" name="tor_file" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png" id="torFileInput">
+                    <i class="fas fa-cloud-upload-alt"></i>
+                    <p class="file-label">Click or drag to upload TOR document</p>
+                </div>
+            </div>
+
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
                 <div class="form-group">
                     <label>Payment for Inspection (₱)</label>
@@ -213,10 +281,20 @@ require_once __DIR__ . '/../../includes/header.php';
                                 <?php endif; ?>
                             </td>
                             <td style="font-size:0.85rem;color:var(--neutral-500)"><?= formatDate($tor['created_at']) ?></td>
-                            <td>
+                            <td style="display:flex;gap:6px;">
                                 <a href="?action=view&id=<?= $tor['id'] ?>" class="btn btn-sm btn-outline">
                                     <i class="fas fa-eye"></i> View
                                 </a>
+                                <?php if (($tor['business_response'] ?? 'pending') !== 'accepted'): ?>
+                                <a href="?action=edit&id=<?= $tor['id'] ?>" class="btn btn-sm btn-primary">
+                                    <i class="fas fa-edit"></i> Edit
+                                </a>
+                                <?php else: ?>
+                                <span class="badge badge-success" style="align-self:center;">
+                                    <i class="fas fa-lock"></i> Accepted
+                                </span>
+                                <?php endif; ?>
+                            </td>
                             </td>
                         </tr>
                         <?php endforeach; ?>
@@ -246,9 +324,31 @@ $tor = $stmt->get_result()->fetch_assoc();
                 Business: <?= ucfirst($tor['business_response'] ?? 'pending') ?>
             </span>
         </div>
-        <div class="card-body" style="white-space: pre-wrap; font-family: 'Times New Roman', serif; font-size: 0.95rem; line-height: 1.8; color: #111;">
-            <?= htmlspecialchars($tor['tor_content']) ?>
-        </div>
+        <?php
+            $has_file = !empty($tor['tor_file_path']);
+            $ext      = $has_file ? strtolower(pathinfo($tor['tor_file_path'], PATHINFO_EXTENSION)) : '';
+            $file_url = $has_file ? BASE_URL . 'uploads/' . htmlspecialchars($tor['tor_file_path']) : '';
+        ?>
+        <?php if ($has_file && $ext === 'pdf'): ?>
+            <iframe src="<?= $file_url ?>" style="width:100%;height:650px;border:none;display:block;"></iframe>
+        <?php elseif ($has_file && in_array($ext, ['jpg','jpeg','png'])): ?>
+            <div style="padding:24px;text-align:center;">
+                <img src="<?= $file_url ?>" alt="TOR Document"
+                     style="max-width:100%;height:auto;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);">
+            </div>
+        <?php elseif ($has_file): ?>
+            <div style="padding:48px;text-align:center;color:var(--neutral-500);">
+                <i class="fas fa-file-alt" style="font-size:3rem;margin-bottom:12px;display:block;"></i>
+                <p>Preview not available for this file type.</p>
+                <a href="<?= $file_url ?>" target="_blank" class="btn btn-outline" style="margin-top:8px;">
+                    <i class="fas fa-external-link-alt"></i> Open File
+                </a>
+            </div>
+        <?php else: ?>
+            <div class="card-body" style="white-space: pre-wrap; font-family: 'Times New Roman', serif; font-size: 0.95rem; line-height: 1.8; color: #111; max-height: 650px; overflow-y: auto;">
+                <?= htmlspecialchars($tor['tor_content']) ?>
+            </div>
+        <?php endif; ?>
     </div>
 
     <div style="display: flex; flex-direction: column; gap: 16px; position: sticky; top: 20px;">
@@ -272,6 +372,15 @@ $tor = $stmt->get_result()->fetch_assoc();
                     <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;">Sent On</div>
                     <div><?= formatDateTime($tor['created_at']) ?></div>
                 </div>
+                <?php if (!empty($tor['tor_file_path'])): ?>
+                <div style="margin-top:12px;">
+                    <div style="font-size:0.8rem;color:var(--neutral-500);text-transform:uppercase;font-weight:600;margin-bottom:6px;">Attached File</div>
+                    <a href="<?= BASE_URL ?>uploads/<?= htmlspecialchars($tor['tor_file_path']) ?>" target="_blank" download
+                       class="btn btn-sm btn-outline" style="width:100%;text-align:center;">
+                        <i class="fas fa-file-download"></i> Download File
+                    </a>
+                </div>
+                <?php endif; ?>
             </div>
         </div>
 
@@ -303,6 +412,101 @@ $tor = $stmt->get_result()->fetch_assoc();
     </div>
 </div>
 <?php endif; ?>
+
+<?php elseif ($action === 'edit' && $edit_tor): ?>
+<a href="?action=list" class="btn btn-outline btn-sm" style="margin-bottom:20px;"><i class="fas fa-arrow-left"></i> Back</a>
+
+<div class="card">
+    <div class="card-header">
+        <h3><i class="fas fa-edit" style="color:var(--primary-600);margin-right:8px;"></i>
+            Edit Terms of Reference — <?= htmlspecialchars($edit_tor['company_name']) ?>
+        </h3>
+    </div>
+    <div class="card-body">
+        <?php if ($edit_tor['business_response'] === 'accepted'): ?>
+        <div class="alert alert-warning" style="margin-bottom:20px;">
+            <i class="fas fa-exclamation-triangle"></i>
+            <span>The business owner has already <strong>accepted</strong> this TOR. Editing and resending will reset their response to pending.</span>
+        </div>
+        <?php endif; ?>
+
+        <form method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="send_tor" value="1">
+            <input type="hidden" name="application_id" value="<?= $edit_tor['application_id'] ?>">
+
+            <!-- Toggle -->
+            <div class="form-group">
+                <label>How would you like to provide the TOR?</label>
+                <div style="display:flex;gap:12px;margin-top:6px;">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal;">
+                        <input type="radio" name="tor_input_mode" value="type"
+                            <?= empty($edit_tor['tor_file_path']) ? 'checked' : '' ?>
+                            onchange="toggleTorMode('type')">
+                        <span>Type / Paste Content</span>
+                    </label>
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal;">
+                        <input type="radio" name="tor_input_mode" value="upload"
+                            <?= !empty($edit_tor['tor_file_path']) ? 'checked' : '' ?>
+                            onchange="toggleTorMode('upload')">
+                        <span>Upload File</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Type mode -->
+            <div id="torTypeMode" class="form-group" <?= !empty($edit_tor['tor_file_path']) ? 'style="display:none;"' : '' ?>>
+                <label>Terms of Reference Content</label>
+                <textarea name="tor_content" class="form-control" rows="12" style="font-size:0.85rem;font-family:monospace;"><?= htmlspecialchars($edit_tor['tor_content']) ?></textarea>
+            </div>
+
+            <!-- Upload mode -->
+            <div id="torUploadMode" class="form-group" <?= empty($edit_tor['tor_file_path']) ? 'style="display:none;"' : '' ?>>
+                <label>Upload TOR File <small style="color:var(--neutral-400);">PDF, DOC, DOCX, JPG, PNG</small></label>
+                <?php if (!empty($edit_tor['tor_file_path'])): ?>
+                <div style="margin-bottom:10px;padding:10px 14px;background:var(--neutral-50);border-radius:8px;font-size:0.85rem;display:flex;align-items:center;gap:10px;">
+                    <i class="fas fa-file" style="color:var(--primary-500);"></i>
+                    <span>Current file: <a href="<?= BASE_URL ?>uploads/<?= htmlspecialchars($edit_tor['tor_file_path']) ?>" target="_blank">View current file</a></span>
+                </div>
+                <?php endif; ?>
+                <div class="file-upload">
+                    <input type="file" name="tor_file" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png" id="torFileInput">
+                    <i class="fas fa-cloud-upload-alt"></i>
+                    <p class="file-label">Upload new file to replace current</p>
+                </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div class="form-group">
+                    <label>Payment for Inspection (₱)</label>
+                    <input type="number" name="payment_for_inspection" class="form-control" step="0.01"
+                        value="<?= $edit_tor['payment_for_inspection'] ?>">
+                </div>
+                <div class="form-group">
+                    <label>Inspection Fees (₱)</label>
+                    <input type="number" name="inspection_fees" class="form-control" step="0.01"
+                        value="<?= $edit_tor['inspection_fees'] ?>">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">
+                <i class="fas fa-paper-plane"></i> Update & Resend TOR
+            </button>
+        </form>
+    </div>
+</div>
+
 <?php endif; ?>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+<script>
+function toggleTorMode(mode) {
+    document.getElementById('torTypeMode').style.display  = mode === 'type'   ? 'block' : 'none';
+    document.getElementById('torUploadMode').style.display = mode === 'upload' ? 'block' : 'none';
+    if (mode === 'upload') {
+        const ta = document.querySelector('textarea[name="tor_content"]');
+        if (ta) ta.value = '';
+    } else {
+        const fi = document.getElementById('torFileInput');
+        if (fi) fi.value = '';
+    }
+}
+</script>

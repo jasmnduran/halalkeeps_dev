@@ -208,6 +208,7 @@ function getSidebarMenu($roleId) {
             ['icon' => 'fas fa-tachometer-alt', 'label' => 'Dashboard', 'url' => BASE_URL . 'dashboard/business_owner/'],
             ['icon' => 'fas fa-file-alt', 'label' => 'Letter of Intent', 'url' => BASE_URL . 'dashboard/business_owner/letter_of_intent.php'],
             ['icon' => 'fas fa-clipboard-list', 'label' => 'Applications', 'url' => BASE_URL . 'dashboard/business_owner/applications.php'],
+            ['icon' => 'fas fa-file-contract', 'label' => 'Terms of Reference', 'url' => BASE_URL . 'dashboard/business_owner/terms_of_reference.php'],
             ['icon' => 'fas fa-flask', 'label' => 'Laboratory', 'url' => BASE_URL . 'dashboard/business_owner/laboratory.php'],
             ['icon' => 'fas fa-certificate', 'label' => 'Certificates', 'url' => BASE_URL . 'dashboard/business_owner/certificates.php'],
             ['icon' => 'fas fa-store', 'label' => 'My Restaurant', 'url' => BASE_URL . 'dashboard/business_owner/restaurant.php'],

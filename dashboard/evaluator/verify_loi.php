@@ -19,6 +19,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($loi_id <= 0 || !in_array($verification_status, ['verified', 'returned'])) {
         $error = 'Invalid submission.';
+    } elseif ($verification_status === 'returned' && empty($feedback)) {
+        $error = 'Remarks are required when rejecting a Letter of Intent.';
     } else {
         $stmt = $conn->prepare("INSERT INTO loi_verification (loi_id, evaluator_id, verification_status, feedback, verified_at) VALUES (?, ?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE verification_status=VALUES(verification_status), feedback=VALUES(feedback), verified_at=NOW()");
         $stmt->bind_param("iiss", $loi_id, $user_id, $verification_status, $feedback);
@@ -68,7 +70,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 // Get LOIs
 $filter = $_GET['filter'] ?? 'submitted';
 $where = $filter === 'all' ? '' : "WHERE loi.status = '$filter'";
-$lois = $conn->query("SELECT loi.*, u.full_name as owner_name, u.email as owner_email FROM letter_of_intent loi JOIN users u ON loi.business_owner_id = u.id $where ORDER BY loi.submitted_at DESC")->fetch_all(MYSQLI_ASSOC);
+$lois = $conn->query("
+    SELECT loi.*, u.full_name as owner_name, u.email as owner_email,
+        (SELECT COUNT(*) FROM loi_verification lv WHERE lv.loi_id = loi.id AND lv.verification_status = 'returned') as was_returned
+    FROM letter_of_intent loi
+    JOIN users u ON loi.business_owner_id = u.id
+    $where
+    ORDER BY loi.submitted_at DESC
+")->fetch_all(MYSQLI_ASSOC);
 
 require_once __DIR__ . '/../../includes/header.php';
 ?>
@@ -103,7 +112,14 @@ require_once __DIR__ . '/../../includes/header.php';
                         <tr>
                             <td><strong><?= htmlspecialchars($loi['company_name']) ?></strong><br><small style="color:var(--neutral-500)"><?= htmlspecialchars(substr($loi['company_address'] ?? '', 0, 40)) ?></small></td>
                             <td><?= htmlspecialchars($loi['owner_name']) ?><br><small style="color:var(--neutral-500)"><?= htmlspecialchars($loi['owner_email']) ?></small></td>
-                            <td><?= getStatusBadge($loi['status']) ?></td>
+                            <td>
+                                <?= getStatusBadge($loi['status']) ?>
+                                <?php if ($loi['status'] === 'submitted' && $loi['was_returned'] > 0): ?>
+                                    <span class="badge badge-info" style="margin-left:4px;font-size:0.72rem;">
+                                        <i class="fas fa-redo"></i> Revised
+                                    </span>
+                                <?php endif; ?>
+                            </td>
                             <td style="font-size:0.85rem;color:var(--neutral-500)"><?= $loi['submitted_at'] ? formatDate($loi['submitted_at']) : '-' ?></td>
                             <td><a href="?action=review&id=<?= $loi['id'] ?>" class="btn btn-sm btn-primary"><i class="fas fa-eye"></i> Review</a></td>
                         </tr>
@@ -121,9 +137,28 @@ require_once __DIR__ . '/../../includes/header.php';
     $stmt->bind_param("i", $_GET['id']);
     $stmt->execute();
     $loi = $stmt->get_result()->fetch_assoc();
+
+    // Check if this LOI was previously returned (revision)
+    $was_returned = false;
+    if ($loi) {
+        $rv = $conn->prepare("SELECT id FROM loi_verification WHERE loi_id = ? AND verification_status = 'returned' LIMIT 1");
+        $rv->bind_param("i", $loi['id']);
+        $rv->execute();
+        $was_returned = (bool) $rv->get_result()->fetch_assoc();
+    }
 ?>
 <?php if ($loi): ?>
 <a href="?action=list" class="btn btn-outline btn-sm" style="margin-bottom: 20px;"><i class="fas fa-arrow-left"></i> Back</a>
+
+<?php if ($was_returned && $loi['status'] === 'submitted'): ?>
+<div class="alert alert-info" style="margin-bottom: 20px;">
+    <i class="fas fa-redo"></i>
+    <div>
+        <strong>Revised & Resubmitted</strong>
+        <p style="margin-top: 2px; font-size: 0.9rem;">The business owner has revised this Letter of Intent based on your previous feedback and resubmitted it for review.</p>
+    </div>
+</div>
+<?php endif; ?>
 
 <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 24px; align-items: start;">
 
@@ -141,11 +176,14 @@ require_once __DIR__ . '/../../includes/header.php';
                 Cubao, Quezon City
             </p>
             <p style="margin-bottom: 24px;">
-                Subject: Letter of Intent for Halal Certification for <strong><?= htmlspecialchars($loi['company_name']) ?></strong>
+                Subject: Letter of Intent for Halal Certification — <strong><?= htmlspecialchars($loi['company_name']) ?></strong>
+                <?php if (!empty($loi['enterprise_type'])): ?>
+                    (<em><?= htmlspecialchars($loi['enterprise_type']) ?></em>)
+                <?php endif; ?>
             </p>
             <p style="margin-bottom: 24px;">Dear Sir/Madam,</p>
             <p style="margin-bottom: 24px;">
-                I am writing to formally express the intent of <strong><?= htmlspecialchars($loi['company_name']) ?></strong> to apply for Halal Certification from the Halal Development Institute of the Philippines (HDIP) for our products/services.
+                I am writing to formally express the intent of <strong><?= htmlspecialchars($loi['company_name']) ?></strong><?php if (!empty($loi['enterprise_type'])): ?>, a <strong><?= htmlspecialchars($loi['enterprise_type']) ?></strong>,<?php endif; ?> to apply for <?= !empty($loi['application_type']) ? '<strong>' . htmlspecialchars($loi['application_type']) . '</strong> of ' : '' ?>Halal Certification from the Halal Development Institute of the Philippines (HDIP) for our products/services.
             </p>
             <p style="margin-bottom: 24px;">
                 Our company, located at <strong><?= htmlspecialchars($loi['company_address']) ?></strong>, produces/serves
@@ -155,7 +193,6 @@ require_once __DIR__ . '/../../includes/header.php';
                 ?>.
                 We are committed to complying with all the requirements and standards set forth by the HDIP, including adherence to Shariah law, GMP (Good Manufacturing Practices), and hygiene standards.
             </p>
-            
             <p style="margin-bottom: 24px;">Thank you for your assistance.</p>
             <p>Sincerely,</p>
             <p style="margin-top: 32px;">
@@ -163,6 +200,17 @@ require_once __DIR__ . '/../../includes/header.php';
                 <?= htmlspecialchars($loi['contact_phone'] ?? '[Phone Number]') ?><br>
                 <?= htmlspecialchars($loi['owner_email']) ?>
             </p>
+            <?php if (!empty($loi['signature_data'])): ?>
+            <div style="margin-top: 24px; border-top: 1px solid #ddd; padding-top: 16px;">
+                <div style="font-size: 0.8rem; color: #888; margin-bottom: 6px; font-family: Arial, sans-serif;">Applicant's Digital Signature:</div>
+                <img src="<?= htmlspecialchars($loi['signature_data']) ?>"
+                     alt="Digital Signature"
+                     style="max-width: 280px; height: auto; border-bottom: 1px solid #333; display: block;">
+                <div style="font-size: 0.75rem; color: #888; margin-top: 4px; font-family: Arial, sans-serif;">
+                    <?= htmlspecialchars($loi['contact_person'] ?? $loi['owner_name']) ?>
+                </div>
+            </div>
+            <?php endif; ?>
         </div>
     </div>
 
@@ -179,13 +227,13 @@ require_once __DIR__ . '/../../includes/header.php';
                 <input type="hidden" name="verification_status" id="verificationStatus">
                 <div class="form-group">
                     <label>Feedback / Remarks</label>
-                    <textarea name="feedback" class="form-control" rows="4" placeholder="Optional notes for the business owner..."><?= htmlspecialchars($loi['remarks'] ?? '') ?></textarea>
+                    <textarea name="feedback" id="loiFeedback" class="form-control" rows="4" placeholder="Required if rejecting — optional for approval..."><?= htmlspecialchars($loi['remarks'] ?? '') ?></textarea>
                 </div>
                 <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
                     <button type="button" class="btn btn-success" onclick="submitVerification('verified')">
                         <i class="fas fa-check-circle"></i> Approve and Send Requirements
                     </button>
-                    <button type="button" class="btn btn-danger" onclick="submitVerification('returned')">
+                    <button type="button" class="btn btn-danger" onclick="submitVerificationWithRemarks('returned')">
                         <i class="fas fa-times-circle"></i> Reject / Return
                     </button>
                 </div>
@@ -227,6 +275,27 @@ require_once __DIR__ . '/../../includes/header.php';
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
 <script>
 function submitVerification(status) {
+    document.getElementById('verificationStatus').value = status;
+    document.getElementById('verifyForm').submit();
+}
+
+function submitVerificationWithRemarks(status) {
+    const feedback = document.getElementById('loiFeedback');
+    if (!feedback || feedback.value.trim() === '') {
+        feedback.style.borderColor = 'var(--danger)';
+        feedback.focus();
+        feedback.placeholder = 'Remarks are required when rejecting.';
+        // Show inline message
+        let msg = document.getElementById('feedbackError');
+        if (!msg) {
+            msg = document.createElement('p');
+            msg.id = 'feedbackError';
+            msg.style.cssText = 'color:var(--danger);font-size:0.82rem;margin-top:4px;';
+            msg.textContent = 'Please provide remarks explaining why the LOI is being rejected.';
+            feedback.parentNode.appendChild(msg);
+        }
+        return;
+    }
     document.getElementById('verificationStatus').value = status;
     document.getElementById('verifyForm').submit();
 }
