@@ -3,10 +3,9 @@ require_once __DIR__ . '/../../config/app.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 
-$page_title = 'Business Owner Dashboard';
-$page_heading = 'Dashboard';
-$is_dashboard = true;
-$user_id = $_SESSION['user_id'];
+// Default landing for business owners is the Restaurant page.
+header('Location: ' . BASE_URL . 'dashboard/business_owner/restaurant.php');
+exit();
 
 // Get stats
 $loi_count = $conn->prepare("SELECT COUNT(*) as c FROM letter_of_intent WHERE business_owner_id = ?");
@@ -97,6 +96,9 @@ require_once __DIR__ . '/../../includes/header.php';
         </a>
         <a href="<?= BASE_URL ?>dashboard/business_owner/certificates.php" class="btn btn-outline">
             <i class="fas fa-certificate"></i> View Certificates
+        </a>
+        <a href="<?= BASE_URL ?>dashboard/business_owner/audit_findings.php" class="btn btn-outline">
+            <i class="fas fa-clipboard-check"></i> Audit Findings
         </a>
         <a href="<?= BASE_URL ?>dashboard/business_owner/restaurant.php" class="btn btn-outline">
             <i class="fas fa-store"></i> Manage Restaurant

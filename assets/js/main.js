@@ -11,6 +11,8 @@ document.addEventListener('DOMContentLoaded', function() {
     initDropdowns();
     initFileUploads();
     initSidebar();
+    initMobileSearch();
+    initNavGroups();
     initTooltips();
 });
 
@@ -113,27 +115,39 @@ function closeModal() {
 // Notifications Panel
 // =====================================================
 function initNotifications() {
-    const notifBtn = document.querySelector('.header-notification');
+    const notifBtn = document.getElementById('notifToggle') || document.querySelector('.header-notification');
     const notifPanel = document.querySelector('.notification-panel');
     const closePanel = document.querySelector('.close-notif-panel');
-    
+
     if (notifBtn && notifPanel) {
         notifBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             const isOpening = !notifPanel.classList.contains('open');
             notifPanel.classList.toggle('open');
+            notifBtn.setAttribute('aria-expanded', String(isOpening));
             if (isOpening) loadNotifications();
         });
-        
+
         if (closePanel) {
             closePanel.addEventListener('click', () => {
                 notifPanel.classList.remove('open');
+                notifBtn.setAttribute('aria-expanded', 'false');
             });
         }
-        
+
         document.addEventListener('click', function(e) {
             if (!notifPanel.contains(e.target) && !notifBtn.contains(e.target)) {
                 notifPanel.classList.remove('open');
+                notifBtn.setAttribute('aria-expanded', 'false');
+            }
+        });
+
+        // Escape key closes the panel
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape' && notifPanel.classList.contains('open')) {
+                notifPanel.classList.remove('open');
+                notifBtn.setAttribute('aria-expanded', 'false');
+                notifBtn.focus();
             }
         });
     }
@@ -202,23 +216,43 @@ function markNotificationRead(id) {
 function initDropdowns() {
     document.querySelectorAll('.dropdown').forEach(dropdown => {
         const trigger = dropdown.querySelector('.dropdown-trigger');
-        const menu = dropdown.querySelector('.dropdown-menu');
-        
+        const menu    = dropdown.querySelector('.dropdown-menu');
+
         if (trigger && menu) {
             trigger.addEventListener('click', function(e) {
                 e.stopPropagation();
-                // Close all other dropdowns
+                // Close all other dropdowns first
                 document.querySelectorAll('.dropdown-menu.show').forEach(m => {
-                    if (m !== menu) m.classList.remove('show');
+                    if (m !== menu) {
+                        m.classList.remove('show');
+                        const otherTrigger = m.closest('.dropdown')?.querySelector('.dropdown-trigger');
+                        if (otherTrigger) otherTrigger.setAttribute('aria-expanded', 'false');
+                    }
                 });
+                const opening = !menu.classList.contains('show');
                 menu.classList.toggle('show');
+                trigger.setAttribute('aria-expanded', String(opening));
+            });
+
+            // Keyboard: open on Enter/Space, close on Escape
+            trigger.addEventListener('keydown', e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    trigger.click();
+                } else if (e.key === 'Escape') {
+                    menu.classList.remove('show');
+                    trigger.setAttribute('aria-expanded', 'false');
+                    trigger.focus();
+                }
             });
         }
     });
-    
+
     document.addEventListener('click', () => {
         document.querySelectorAll('.dropdown-menu.show').forEach(menu => {
             menu.classList.remove('show');
+            const trigger = menu.closest('.dropdown')?.querySelector('.dropdown-trigger');
+            if (trigger) trigger.setAttribute('aria-expanded', 'false');
         });
     });
 }
@@ -245,26 +279,224 @@ function initFileUploads() {
 }
 
 // =====================================================
-// Sidebar Mobile Toggle
+// Sidebar Toggle — Desktop collapse + Mobile overlay
+
+// =====================================================
+// Sidebar Toggle -- Tailwind off-canvas drawer
+// Mobile  (<1024px): slide-in overlay drawer
+// Desktop (>=1024px): static persistent sidebar
+//   + optional icon-collapse via sidebar-collapsed class
 // =====================================================
 function initSidebar() {
-    const sidebarToggle = document.querySelector('.sidebar-toggle');
-    const sidebar = document.querySelector('.sidebar');
-    const overlay = document.querySelector('.sidebar-overlay');
-    
-    if (sidebarToggle && sidebar) {
-        sidebarToggle.addEventListener('click', () => {
-            sidebar.classList.toggle('open');
-            if (overlay) overlay.classList.toggle('active');
+    const sidebar     = document.getElementById('sidebar');
+    const overlay     = document.getElementById('sidebarOverlay');
+    const hamburger   = document.getElementById('sidebarToggle');      // mobile burger
+    const collapseBtn = document.getElementById('sidebarCollapseBtn'); // desktop collapse
+    const closeBtn    = document.getElementById('sidebarCloseBtn');    // x inside drawer
+    const layout      = document.querySelector('.dashboard-layout') || document.querySelector('.tw-flex') || document.body;
+
+    const LG = 1024; // must match Tailwind lg breakpoint
+    const isDesktop = () => window.innerWidth >= LG;
+
+    if (!sidebar) return;
+
+    // ---- Helpers -------------------------------------------------------
+    function openMobileSidebar() {
+        sidebar.classList.remove('tw--translate-x-full');
+        sidebar.classList.add('tw-translate-x-0', 'tw-shadow-2xl');
+        if (overlay) {
+            overlay.classList.remove('tw-opacity-0', 'tw-pointer-events-none');
+            overlay.classList.add('tw-opacity-100', 'tw-pointer-events-auto');
+            overlay.setAttribute('aria-hidden', 'false');
+        }
+        document.body.style.overflow = 'hidden';
+        if (hamburger) hamburger.setAttribute('aria-expanded', 'true');
+        sidebar.setAttribute('aria-hidden', 'false');
+        const firstLink = sidebar.querySelector('a[href], button');
+        if (firstLink) firstLink.focus();
+    }
+
+    function closeMobileSidebar() {
+        sidebar.classList.add('tw--translate-x-full');
+        sidebar.classList.remove('tw-translate-x-0', 'tw-shadow-2xl');
+        if (overlay) {
+            overlay.classList.add('tw-opacity-0', 'tw-pointer-events-none');
+            overlay.classList.remove('tw-opacity-100', 'tw-pointer-events-auto');
+            overlay.setAttribute('aria-hidden', 'true');
+        }
+        document.body.style.overflow = '';
+        if (hamburger) {
+            hamburger.setAttribute('aria-expanded', 'false');
+            hamburger.focus();
+        }
+        sidebar.setAttribute('aria-hidden', 'true');
+    }
+
+    function collapseDesktopSidebar() {
+        layout.classList.add('sidebar-collapsed');
+        if (collapseBtn) collapseBtn.setAttribute('aria-expanded', 'false');
+        localStorage.setItem('sidebar_collapsed', 'true');
+    }
+
+    function expandDesktopSidebar() {
+        layout.classList.remove('sidebar-collapsed');
+        if (collapseBtn) collapseBtn.setAttribute('aria-expanded', 'true');
+        localStorage.setItem('sidebar_collapsed', 'false');
+    }
+
+    // ---- Boot state ----------------------------------------------------
+    if (isDesktop()) {
+        sidebar.setAttribute('aria-hidden', 'false');
+        if (localStorage.getItem('sidebar_collapsed') === 'true') {
+            layout.classList.add('sidebar-collapsed');
+            if (collapseBtn) collapseBtn.setAttribute('aria-expanded', 'false');
+        }
+    } else {
+        sidebar.setAttribute('aria-hidden', 'true');
+    }
+
+    // data-label for collapsed icon tooltips
+    sidebar.querySelectorAll('.nav-link:not(.nav-group-toggle)').forEach(link => {
+        const span = link.querySelector('span');
+        if (span) link.setAttribute('data-label', span.textContent.trim());
+    });
+
+    // ---- Hamburger opens drawer (mobile) --------------------------------
+    if (hamburger) {
+        hamburger.addEventListener('click', e => {
+            e.stopPropagation();
+            openMobileSidebar();
         });
     }
-    
+
+    // ---- Desktop collapse/expand toggle ---------------------------------
+    if (collapseBtn) {
+        collapseBtn.addEventListener('click', () => {
+            layout.classList.contains('sidebar-collapsed')
+                ? expandDesktopSidebar()
+                : collapseDesktopSidebar();
+        });
+    }
+
+    // ---- Close button inside drawer -------------------------------------
+    if (closeBtn) {
+        closeBtn.addEventListener('click', closeMobileSidebar);
+    }
+
+    // ---- Backdrop click closes drawer -----------------------------------
     if (overlay) {
-        overlay.addEventListener('click', () => {
-            sidebar.classList.remove('open');
-            overlay.classList.remove('active');
+        overlay.addEventListener('click', closeMobileSidebar);
+    }
+
+    // ---- Escape key closes drawer ---------------------------------------
+    document.addEventListener('keydown', e => {
+        if (e.key !== 'Escape') return;
+        if (!isDesktop() && !sidebar.classList.contains('tw--translate-x-full')) {
+            closeMobileSidebar();
+        }
+    });
+
+    // ---- Nav link click closes mobile drawer ----------------------------
+    sidebar.querySelectorAll('.nav-link').forEach(link => {
+        if (link.classList.contains('nav-group-toggle')) return;
+        link.addEventListener('click', () => {
+            if (!isDesktop()) closeMobileSidebar();
+        });
+    });
+
+    // ---- Resize: debounced cleanup --------------------------------------
+    let resizeTimer;
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+            if (isDesktop()) {
+                if (overlay) {
+                    overlay.classList.add('tw-opacity-0', 'tw-pointer-events-none');
+                    overlay.classList.remove('tw-opacity-100', 'tw-pointer-events-auto');
+                    overlay.setAttribute('aria-hidden', 'true');
+                }
+                document.body.style.overflow = '';
+                sidebar.setAttribute('aria-hidden', 'false');
+                sidebar.classList.remove('tw-shadow-2xl');
+                if (localStorage.getItem('sidebar_collapsed') === 'true') {
+                    layout.classList.add('sidebar-collapsed');
+                }
+            } else {
+                layout.classList.remove('sidebar-collapsed');
+                if (!sidebar.classList.contains('tw-translate-x-0')) {
+                    sidebar.setAttribute('aria-hidden', 'true');
+                }
+            }
+        }, 100);
+    });
+}
+
+// Global helpers for onclick attributes in header.php
+function openSidebar()  { document.getElementById('sidebarToggle')?.click(); }
+function closeSidebar() { document.getElementById('sidebarCloseBtn')?.click(); }
+
+// =====================================================
+// Mobile Search Bar Toggle
+// =====================================================
+function initMobileSearch() {
+    const toggleBtn  = document.getElementById('mobileSearchToggle');
+    const closeBtn   = document.getElementById('mobileSearchClose');
+    const searchBar  = document.getElementById('mobileSearchBar');
+    const mobileInput = document.getElementById('mobileSearchInput');
+    const desktopInput = document.getElementById('globalSearch');
+
+    if (!toggleBtn || !searchBar) return;
+
+    function openSearch() {
+        searchBar.classList.add('open');
+        searchBar.setAttribute('aria-hidden', 'false');
+        toggleBtn.setAttribute('aria-expanded', 'true');
+        // Sync any existing desktop search value
+        if (desktopInput && mobileInput) {
+            mobileInput.value = desktopInput.value;
+        }
+        if (mobileInput) {
+            mobileInput.focus();
+        }
+    }
+
+    function closeSearch() {
+        searchBar.classList.remove('open');
+        searchBar.setAttribute('aria-hidden', 'true');
+        toggleBtn.setAttribute('aria-expanded', 'false');
+        toggleBtn.focus(); // return focus
+    }
+
+    toggleBtn.addEventListener('click', () => {
+        searchBar.classList.contains('open') ? closeSearch() : openSearch();
+    });
+
+    if (closeBtn) {
+        closeBtn.addEventListener('click', closeSearch);
+    }
+
+    // Sync mobile input back to the hidden desktop input so any
+    // existing search listeners keep working
+    if (mobileInput && desktopInput) {
+        mobileInput.addEventListener('input', () => {
+            desktopInput.value = mobileInput.value;
+            // Fire an input event so downstream listeners pick it up
+            desktopInput.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        mobileInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter') {
+                desktopInput.dispatchEvent(new Event('change', { bubbles: true }));
+                desktopInput.form?.submit();
+            }
         });
     }
+
+    // Escape key closes the search bar
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && searchBar.classList.contains('open')) {
+            closeSearch();
+        }
+    });
 }
 
 // =====================================================
@@ -436,5 +668,51 @@ function showRoleFields(roleId) {
     if (fields) fields.style.display = 'block';
 }
 
+// =====================================================
+// Collapsible Sidebar Nav Groups
+// =====================================================
+function initNavGroups() {
+    // Nothing to do — state is set by PHP inline styles and toggled by CSS class.
+}
+
+function toggleNavGroup(groupId, toggleEl) {
+    var children = document.getElementById(groupId);
+    if (!children) return;
+
+    var opening = !children.classList.contains('ng-open');
+    children.classList.toggle('ng-open');
+
+    var chevron = toggleEl.querySelector('.nav-group-chevron');
+    if (chevron) chevron.classList.toggle('open', opening);
+    toggleEl.setAttribute('aria-expanded', String(opening));
+    toggleEl.classList.toggle('active', opening);
+}
+
+// =====================================================
 // Global BASE_URL
-const BASE_URL = '/halal_final/';
+// Primary source: window.BASE_URL injected by includes/footer.php via PHP.
+// Fallback: derive it from the current page URL so the subfolder (e.g.
+// /halal_final/) is preserved on localhost and any nested deploy path.
+// Strategy — walk up from the current script's directory until we reach the
+// known top-level folders of this app (auth, dashboard, admin, assets, api).
+const BASE_URL = (function () {
+    if (typeof window.BASE_URL !== 'undefined' && window.BASE_URL !== '') {
+        return window.BASE_URL;
+    }
+
+    // Split the pathname into segments and find the app root by looking for
+    // the first segment that matches a known top-level app directory.
+    const topLevel = new Set(['auth', 'dashboard', 'admin', 'assets', 'api', 'config', 'includes', 'uploads']);
+    const parts    = window.location.pathname.replace(/\\/g, '/').split('/').filter(Boolean);
+    const rootParts = [];
+
+    for (const part of parts) {
+        if (topLevel.has(part.toLowerCase())) break;
+        // Stop if it looks like a .php file
+        if (part.includes('.')) break;
+        rootParts.push(part);
+    }
+
+    const subpath = rootParts.length ? '/' + rootParts.join('/') + '/' : '/';
+    return window.location.origin + subpath;
+}());

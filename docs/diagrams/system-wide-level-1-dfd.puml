@@ -1,0 +1,205 @@
+@startuml
+title Halal Keeps - System-Wide Level 1 Data Flow Diagram
+
+left to right direction
+skinparam backgroundColor #FAFAF8
+skinparam shadowing false
+skinparam roundcorner 14
+skinparam linetype ortho
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+skinparam ArrowColor #475569
+skinparam ArrowFontColor #334155
+skinparam ArrowThickness 1.2
+skinparam packageStyle rectangle
+skinparam packageBorderColor #0F766E
+skinparam packageBackgroundColor #F8FFFD
+skinparam databaseBorderColor #1D4ED8
+skinparam databaseBackgroundColor #EFF6FF
+skinparam folderBorderColor #7C3AED
+skinparam folderBackgroundColor #F5F3FF
+
+' External entities
+rectangle "Visitor / Customer" as E_CUSTOMER <<External Entity>> #FFF7ED
+rectangle "Business Owner" as E_OWNER <<External Entity>> #FFF7ED
+rectangle "Restaurant Staff\nOperations Manager / Cashier / Chef" as E_STAFF <<External Entity>> #FFF7ED
+rectangle "System Administrator" as E_ADMIN <<External Entity>> #FFF7ED
+
+rectangle "Google OAuth" as X_GOOGLE <<External System>> #FDF2F8
+rectangle "PayMongo" as X_PAYMONGO <<External System>> #FDF2F8
+rectangle "Configured AI Provider\n(conditional)" as X_AI <<External System>> #FDF2F8
+
+package "HALAL KEEPS APPLICATION BOUNDARY" as HK {
+  rectangle "1.0\nManage Accounts\nand Access" as P1 <<Process>> #DCFCE7
+  rectangle "2.0\nProcess Business and\nStaff Onboarding" as P2 <<Process>> #DCFCE7
+  rectangle "3.0\nManage Restaurant Catalogue\nand Operations" as P3 <<Process>> #DCFCE7
+  rectangle "4.0\nCapture Demand and\nMarketplace Engagement" as P4 <<Process>> #DCFCE7
+
+  rectangle "5.0\nProcess Orders\nand Payments" as P5 <<Process>> #D1FAE5
+  rectangle "6.0\nManage Finance\nand Reporting" as P6 <<Process>> #D1FAE5
+  rectangle "7.0\nAssess Halal\nReadiness" as P7 <<Process>> #D1FAE5
+  rectangle "8.0\nAdminister and Monitor\nthe Platform" as P8 <<Process>> #D1FAE5
+
+  database "D1\nAccounts, Roles,\nand Staff" as D1
+  database "D2\nBusiness Registry\nand Certificates" as D2
+  database "D3\nCatalogue, Engagement,\nand Reviews" as D3
+  database "D4\nSurvey and\nDemand Data" as D4
+
+  database "D5\nOrders, Payments, Status,\nand Notifications" as D5
+  database "D6\nKitchen and\nFinancial Operations" as D6
+  database "D7\nHaCeRa and\nAI Insights" as D7
+  database "D8\nAudit and\nConfiguration" as D8
+  folder "F1\nUpload Storage" as F1
+
+  ' Layout anchors only
+  P1 -[hidden]right-> P2
+  P2 -[hidden]right-> P3
+  P3 -[hidden]right-> P4
+  P5 -[hidden]right-> P6
+  P6 -[hidden]right-> P7
+  P7 -[hidden]right-> P8
+  P1 -[hidden]down-> P5
+
+  D1 -[hidden]right-> D2
+  D2 -[hidden]right-> D3
+  D3 -[hidden]right-> D4
+  D5 -[hidden]right-> D6
+  D6 -[hidden]right-> D7
+  D7 -[hidden]right-> D8
+  D1 -[hidden]down-> D5
+  P5 -[hidden]down-> D1
+
+  ' Process-to-store flows
+  P1 --> D1 : user profiles, credentials,\nroles and staff-role lookup
+  D1 --> P1 : identity, role and\naccess data
+
+  P2 --> D1 : role promotion and\nstaff assignments
+  D1 --> P2 : applicant, owner and\nstaff-role data
+  P2 --> D2 : applications, branches, decisions,\nrestaurants and certificates
+  D2 --> P2 : application and\nbusiness records
+  P2 --> D5 : onboarding notifications
+  P2 --> F1 : business and staff\nsupporting files
+
+  P3 --> D2 : restaurant profile updates
+  D2 --> P3 : restaurant and\ncertificate profile
+  P3 --> D3 : menu, availability and\nreview responses
+  D3 --> P3 : menu submissions, reviews\nand engagement data
+  P3 --> D6 : inventory, suppliers, recipes,\ngroceries and requisitions
+  D6 --> P3 : stock, cost and\nrequisition state
+  P3 --> D5 : operational notifications
+  P3 --> F1 : menu, recipe and\noperational evidence files
+
+  P4 --> D3 : profile views, reviews, photos\nand credibility results
+  D3 --> P4 : catalogue, ratings, views\nand credibility inputs
+  D2 --> P4 : active restaurant and\ncertificate data
+  P4 --> D4 : TPB responses and\nitem answers
+  D4 --> P4 : survey results and\ndemand aggregates
+  P4 --> F1 : review photos
+
+  D3 --> P5 : approved available\nmenu data
+  D4 --> P5 : survey completion and\nresponse reference
+  P5 --> D4 : order-to-survey link
+  P5 --> D5 : orders, payment records, cash data,\nstatus history and notifications
+  D5 --> P5 : order, payment and\nfulfilment state
+
+  D5 --> P6 : paid orders and\ndelivery-fee data
+  P6 --> D6 : expenses, inflows and\nitemised cost records
+  D6 --> P6 : operating costs, approved inflows\nand kitchen purchase data
+  D3 --> P6 : traffic, ratings and\ncredibility data
+  D4 --> P6 : demand analytics
+  P6 --> F1 : receipt and inflow evidence
+
+  D2 --> P7 : owner restaurant and\npublished readiness fields
+  P7 --> D2 : published HRP, band\nand publication time
+  P7 --> D7 : responses, evidence references, scores,\nAI runs, findings, actions and feedback
+  D7 --> P7 : assessment state and\nvalidated advisory results
+  P7 --> F1 : HaCeRa evidence files
+
+  P8 --> D1 : user and role administration
+  D1 --> P8 : account and access records
+  P8 --> D8 : settings, classifications and\nadmin monitoring records
+  D8 --> P8 : audit, login and\nconfiguration data
+
+  ' Domain audit events
+  P1 ..> D8 : authentication events
+  P2 ..> D8 : onboarding decisions
+  P3 ..> D8 : operational events
+  P5 ..> D8 : order/payment events
+  P7 ..> D8 : readiness/AI events
+}
+
+' Human actor flows
+E_CUSTOMER --> P1 : registration, login and\nprofile data
+P1 --> E_CUSTOMER : session access and\nauthentication outcome
+
+E_CUSTOMER --> P2 : business/staff applications,\nbranch data and evidence
+P2 --> E_CUSTOMER : application status and\nonboarding notifications
+E_OWNER --> P2 : staff decisions and\nrole assignments
+E_ADMIN --> P2 : business review decision\nand classification
+
+E_OWNER --> P3 : profile, menu and\noperations data
+E_STAFF --> P3 : menu, inventory, recipe and\ngrocery/requisition data
+P3 --> E_OWNER : catalogue and\noperations state
+P3 --> E_STAFF : approvals, assignments and\noperational state
+
+E_CUSTOMER --> P4 : browse/search, TPB answers,\nviews and reviews
+P4 --> E_CUSTOMER : restaurant/menu data, survey results,\nratings and credibility
+E_OWNER --> P4 : demand and engagement\nanalytics request
+P4 --> E_OWNER : demand, traffic and\ncredibility analytics
+
+E_CUSTOMER --> P5 : cart, service, address,\npayment and receipt confirmation
+P5 --> E_CUSTOMER : checkout URL, order status\nand notifications
+E_OWNER --> P5 : POS orders, cash confirmation\nand fulfilment updates
+E_STAFF --> P5 : POS/order actions, cash data\nand fulfilment updates
+P5 --> E_OWNER : order/payment state\nand notifications
+P5 --> E_STAFF : order queue, payment state\nand kitchen/cashier alerts
+
+E_OWNER --> P6 : report request and\nowner expense data
+E_STAFF --> P6 : expense, inflow and\nreport requests
+P6 --> E_OWNER : financial, traffic and\ndemand reports
+P6 --> E_STAFF : authorised operational\nand financial views
+
+E_OWNER --> P7 : readiness answers, evidence,\npublish/PDF/AI request and feedback
+P7 --> E_OWNER : module scores, HRP/band, PDF\nand validated advisory results
+
+E_ADMIN --> P8 : settings, user/security and\nmonitoring requests
+P8 --> E_ADMIN : account, log, classification\nand system status data
+
+' External-system flows
+P1 --> X_GOOGLE : OAuth authorisation and\ntoken/profile request
+X_GOOGLE --> P1 : authorisation code, token\nand identity profile
+
+P5 --> X_PAYMONGO : checkout/session request\nand payment metadata
+X_PAYMONGO --> P5 : hosted checkout URL and\nqualified return/payment data
+
+P7 ..> X_AI : restricted structured assessment\ncontext (only when enabled/configured)
+X_AI ..> P7 : untrusted JSON advisory report\n(validated before storage)
+
+note bottom of X_PAYMONGO
+  Checkout creation is implemented.
+  Customer return, POS verification, and the generic
+  webhook do not share one fully verified schema contract.
+end note
+
+note bottom of X_AI
+  Conditional integration. AI output cannot change
+  readiness scores, publication, or certification state.
+end note
+
+legend bottom
+  |= Shape / line |= Meaning |
+  |<#FFF7ED> Rectangle | Human external entity |
+  |<#FDF2F8> Rectangle | External service |
+  |<#DCFCE7> Rounded rectangle | Numbered Level 1 process |
+  |<#EFF6FF> Database | Logical grouped data store |
+  |<#F5F3FF> Folder | Local upload storage |
+  | Solid arrow | Verified implemented data flow |
+  | Dotted arrow | Conditional, audit, or qualified flow |
+
+  **Excluded:** incomplete legacy HDP evaluator/auditor/laboratory/
+  committee/president pipeline and missing legacy endpoints.
+  This is a practical PlantUML DFD representation, not a claim of
+  strict Yourdon, DeMarco, or Gane-Sarson notation compliance.
+endlegend
+
+@enduml

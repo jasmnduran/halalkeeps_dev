@@ -2,11 +2,15 @@
 require_once __DIR__ . '/../config/app.php';
 requireLogin();
 
-// If user already has an approved role, redirect to dashboard
-if (hasApprovedRole()) {
-    header('Location: ' . getDashboardUrl($_SESSION['role_id']));
+// ── RBAC guard ────────────────────────────────────────────────────────────────
+// apply_role.php is a legacy admin/HCB-staff tool and must never be reachable
+// by standard users. Any logged-in non-admin is silently redirected to their
+// own dashboard instead of receiving a confusing role-selection screen.
+if (empty($_SESSION['is_admin'])) {
+    header('Location: ' . getDashboardUrl($_SESSION['role_id'] ?? ROLE_CUSTOMER));
     exit();
 }
+// ─────────────────────────────────────────────────────────────────────────────
 
 $error = '';
 $success = '';
