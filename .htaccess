@@ -1,5 +1,6 @@
 # =============================================================================
 # Halal Keeps — .htaccess
+# Compatible with InfinityFree / shared cPanel hosting
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -8,8 +9,8 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
 
-    # If the app is deployed in a subfolder on localhost (e.g. /halal_final/),
-    # set RewriteBase to match. On production (domain root) leave it as /.
+    # Production: app lives at the domain root (APP_SUBFOLDER is empty).
+    # Local XAMPP: change RewriteBase to /halal_final_dev/ to match your subfolder.
     RewriteBase /
 
     # Allow direct access to real files and directories
@@ -21,38 +22,22 @@
 </IfModule>
 
 # -----------------------------------------------------------------------------
-# HTTPS redirect — uncomment on production after SSL is active
+# HTTPS redirect — active on production (InfinityFree provides free SSL)
+# Comment out if testing over HTTP first
 # -----------------------------------------------------------------------------
-# <IfModule mod_rewrite.c>
-#     RewriteCond %{HTTPS} off
-#     RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
-# </IfModule>
-
-# -----------------------------------------------------------------------------
-# Security headers
-# -----------------------------------------------------------------------------
-<IfModule mod_headers.c>
-    # Prevent MIME-type sniffing
-    Header always set X-Content-Type-Options "nosniff"
-
-    # Clickjacking protection
-    Header always set X-Frame-Options "SAMEORIGIN"
-
-    # Basic XSS filter for older browsers
-    Header always set X-XSS-Protection "1; mode=block"
-
-    # Don't send referrer to external sites
-    Header always set Referrer-Policy "strict-origin-when-cross-origin"
-
-    # Remove server signature
-    Header unset Server
-    Header unset X-Powered-By
+<IfModule mod_rewrite.c>
+    RewriteCond %{HTTPS} off
+    RewriteCond %{HTTP_HOST} !^localhost [NC]
+    RewriteCond %{HTTP_HOST} !^127\. [NC]
+    RewriteCond %{HTTP_HOST} !^192\.168\. [NC]
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
 </IfModule>
 
 # -----------------------------------------------------------------------------
 # Block direct access to sensitive files
+# (.htaccess, .env, composer files, .git, .user.ini)
 # -----------------------------------------------------------------------------
-<FilesMatch "^\.env|composer\.(json|lock)$|\.git">
+<FilesMatch "(^\.env|^\.user\.ini|composer\.(json|lock)|^\.git|^\.htaccess)$">
     <IfModule mod_authz_core.c>
         Require all denied
     </IfModule>
@@ -62,44 +47,15 @@
     </IfModule>
 </FilesMatch>
 
-# Block access to the uploads folder's PHP files (prevent webshell execution)
-<FilesMatch "\.php$">
-    <If "%{REQUEST_URI} =~ m#/uploads/#">
-        <IfModule mod_authz_core.c>
-            Require all denied
-        </IfModule>
-    </If>
-</FilesMatch>
-
-# -----------------------------------------------------------------------------
-# PHP settings — raise limits for multi-branch forms and file uploads
-# -----------------------------------------------------------------------------
-<IfModule mod_php.c>
-    php_value max_input_vars          5000
-    php_value max_input_nesting_level 128
-    php_value upload_max_filesize     40M
-    php_value post_max_size           40M
-    php_value max_file_uploads        50
-    php_value memory_limit            256M
-    php_flag  display_errors          Off
-    php_flag  log_errors              On
-    php_value error_log               /var/log/php_errors.log
-</IfModule>
-
-# Shared-hosting fallback (some hosts use mod_php8 / php_admin_value)
-<IfModule mod_php8.c>
-    php_value max_input_vars          5000
-    php_value max_input_nesting_level 128
-    php_value upload_max_filesize     40M
-    php_value post_max_size           40M
-    php_value max_file_uploads        50
-    php_value memory_limit            256M
-    php_flag  display_errors          Off
-    php_flag  log_errors              On
+# Block PHP execution inside the uploads directory (prevent webshell uploads)
+<IfModule mod_rewrite.c>
+    RewriteCond %{REQUEST_URI} ^/uploads/.*\.php$ [NC]
+    RewriteRule ^ - [F,L]
 </IfModule>
 
 # -----------------------------------------------------------------------------
 # Compression — speeds up page loads
+# (mod_deflate is available on InfinityFree)
 # -----------------------------------------------------------------------------
 <IfModule mod_deflate.c>
     AddOutputFilterByType DEFLATE text/html text/css text/javascript
@@ -112,11 +68,18 @@
 # -----------------------------------------------------------------------------
 <IfModule mod_expires.c>
     ExpiresActive On
-    ExpiresByType text/css             "access plus 1 month"
+    ExpiresByType text/css               "access plus 1 month"
     ExpiresByType application/javascript "access plus 1 month"
-    ExpiresByType image/jpeg           "access plus 1 month"
-    ExpiresByType image/png            "access plus 1 month"
-    ExpiresByType image/webp           "access plus 1 month"
-    ExpiresByType image/svg+xml        "access plus 1 month"
-    ExpiresByType application/json     "access plus 1 day"
+    ExpiresByType image/jpeg             "access plus 1 month"
+    ExpiresByType image/png              "access plus 1 month"
+    ExpiresByType image/webp             "access plus 1 month"
+    ExpiresByType image/svg+xml          "access plus 1 month"
+    ExpiresByType application/json       "access plus 1 day"
 </IfModule>
+
+# -----------------------------------------------------------------------------
+# NOTE: PHP settings (upload limits, memory, display_errors) are controlled
+# via .user.ini in the project root — InfinityFree uses CGI/FastCGI so
+# php_value / php_flag directives inside .htaccess are NOT supported.
+# mod_headers is also not available on InfinityFree.
+# -----------------------------------------------------------------------------

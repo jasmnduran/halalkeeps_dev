@@ -12,6 +12,7 @@ require_once __DIR__ . '/../../../includes/HaCeRaAIService.php';
 require_once __DIR__ . '/../../../includes/HaCeRaEvidenceValidator.php';
 require_once __DIR__ . '/../../../includes/HaCeRaInsightsRepository.php';
 require_once __DIR__ . '/../../../includes/HaCeRaAIProcessor.php';
+require_once __DIR__ . '/../../../includes/RevenuePaymentService.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -55,10 +56,20 @@ $restaurant = $restaurantStmt->get_result()->fetch_assoc();
 $restaurantStmt->close();
 if (!$restaurant) hacera_ai_json(['success' => false, 'message' => 'No active restaurant is assigned to this account.'], 404);
 $restaurantId = (int)$restaurant['id'];
+$purchaseId = (int)($_POST['purchase_id'] ?? $_GET['purchase_id'] ?? $body['purchase_id'] ?? 0);
+$billing = new RevenuePaymentService($conn);
+$premiumAccess = $billing->getHaceraPremiumAccess($userId, $restaurantId, $purchaseId);
+if ($premiumAccess === null) {
+    hacera_ai_json(['success' => false, 'payment_required' => true, 'message' => 'A verified PHP 150 HaCeRa Premium Assessment Results payment is required before AI insights can be generated or viewed.'], 402);
+}
+$assessmentVersionHash = (string)($premiumAccess['snapshot_hash'] ?? '');
+if (!preg_match('/^[a-f0-9]{64}$/', $assessmentVersionHash)) {
+    hacera_ai_json(['success' => false, 'payment_required' => true, 'message' => 'The premium entitlement is invalid. Please contact support.'], 402);
+}
 
 $repository = new HaCeRaInsightsRepository($conn);
 if (!$repository->hasSchema()) {
-    hacera_ai_json(['success' => false, 'message' => 'AI Insights has not been installed. Run database/hacera_ai_insights_migration.sql first.'], 503);
+    hacera_ai_json(['success' => false, 'message' => 'AI Insights premium access is not installed. Apply database/hacera_ai_insights_migration.sql and database_migrations/add_hacera_premium_access.sql first.'], 503);
 }
 $builder = new HaCeRaContextBuilder($conn);
 $service = new HaCeRaAIService();
@@ -67,21 +78,26 @@ $processor = new HaCeRaAIProcessor($builder, $service, new HaCeRaEvidenceValidat
 try {
     if ($action === 'generate') {
         hacera_ai_require_csrf($body);
+        $currentPremiumAccess = $billing->getHaceraPremiumAccess($userId, $restaurantId);
+        if ($currentPremiumAccess === null) {
+            hacera_ai_json(['success' => false, 'payment_required' => true, 'message' => 'This assessment version is not covered by a verified premium payment.'], 402);
+        }
+        $assessmentVersionHash = (string)$currentPremiumAccess['snapshot_hash'];
         $dailyLimit = max(1, min(100, (int)(getenv('HACERA_AI_MAX_RUNS_PER_DAY') ?: 10)));
         if ($repository->countRecentRuns($restaurantId) >= $dailyLimit) {
             hacera_ai_json(['success' => false, 'message' => 'The daily AI analysis limit for this restaurant has been reached.'], 429);
         }
         $context = $builder->build($restaurantId);
         $inputHash = $builder->hash($context);
-        $existing = $repository->findReusableRun($restaurantId, $inputHash);
+        $existing = $repository->findReusableRun($restaurantId, $inputHash, $assessmentVersionHash);
         if ($existing !== null) {
-            $run = $repository->getRun((int)$existing['id'], $restaurantId);
+            $run = $repository->getRun((int)$existing['id'], $restaurantId, $assessmentVersionHash);
             hacera_ai_json(['success' => true, 'deduplicated' => true, 'run' => $run]);
         }
         if (!$service->isConfigured()) {
             hacera_ai_json(['success' => false, 'message' => 'The AI provider is not configured.'], 503);
         }
-        $runId = $repository->createRun($restaurantId, $userId, $inputHash, $service->provider(), (string)(getenv('HACERA_AI_MODEL') ?: ''), (string)$context['criteria_version']);
+        $runId = $repository->createRun($restaurantId, $userId, $inputHash, $assessmentVersionHash, $service->provider(), (string)(getenv('HACERA_AI_MODEL') ?: ''), (string)$context['criteria_version']);
         @logActivity($conn, $userId, 'hacera_ai_requested', 'Requested AI readiness analysis for restaurant #' . $restaurantId, 'hacera_ai');
 
         if (HaCeRaAIService::shouldProcessInline()) {
@@ -101,13 +117,13 @@ try {
             }
             hacera_ai_json(['success' => true, 'run' => $processed['run']]);
         }
-        hacera_ai_json(['success' => true, 'queued' => true, 'run' => $repository->getRun($runId, $restaurantId)]);
+        hacera_ai_json(['success' => true, 'queued' => true, 'run' => $repository->getRun($runId, $restaurantId, $assessmentVersionHash)]);
     }
 
     if ($action === 'status' || $action === 'results') {
         $runId = (int)($_GET['run_id'] ?? $body['run_id'] ?? 0);
         if ($runId < 1) hacera_ai_json(['success' => false, 'message' => 'A valid analysis request is required.'], 422);
-        $run = $repository->getRun($runId, $restaurantId);
+        $run = $repository->getRun($runId, $restaurantId, $assessmentVersionHash);
         if ($run === null) hacera_ai_json(['success' => false, 'message' => 'Analysis request not found.'], 404);
         $context = $builder->build($restaurantId);
         $run['is_outdated'] = !hash_equals((string)$run['input_hash'], $builder->hash($context));
@@ -116,7 +132,7 @@ try {
 
     if ($action === 'history') {
         $currentHash = $builder->hash($builder->build($restaurantId));
-        $history = $repository->history($restaurantId);
+        $history = $repository->history($restaurantId, $assessmentVersionHash);
         foreach ($history as &$row) $row['is_outdated'] = !hash_equals((string)$row['input_hash'], $currentHash);
         hacera_ai_json(['success' => true, 'history' => $history]);
     }
@@ -125,7 +141,7 @@ try {
         hacera_ai_require_csrf($body);
         $actionId = (int)($_POST['action_id'] ?? $body['action_id'] ?? 0);
         $status = (string)($_POST['action_status'] ?? $body['action_status'] ?? '');
-        if ($actionId < 1 || !$repository->updateAction($actionId, $restaurantId, $userId, $status)) {
+        if ($actionId < 1 || !$repository->updateAction($actionId, $restaurantId, $userId, $status, $assessmentVersionHash)) {
             hacera_ai_json(['success' => false, 'message' => 'The action could not be updated.'], 422);
         }
         @logActivity($conn, $userId, 'hacera_ai_action_updated', 'Updated AI corrective action #' . $actionId, 'hacera_ai');
@@ -137,10 +153,10 @@ try {
         $runId = (int)($_POST['run_id'] ?? $body['run_id'] ?? 0);
         $rating = (int)($_POST['rating'] ?? $body['rating'] ?? 0);
         $comment = (string)($_POST['comment'] ?? $body['comment'] ?? '');
-        if ($runId < 1 || $rating < 1 || $rating > 5 || $repository->getRun($runId, $restaurantId) === null) {
+        if ($runId < 1 || $rating < 1 || $rating > 5 || $repository->getRun($runId, $restaurantId, $assessmentVersionHash) === null) {
             hacera_ai_json(['success' => false, 'message' => 'Feedback could not be saved.'], 422);
         }
-        if (!$repository->submitFeedback($runId, $restaurantId, $userId, $rating, $comment)) {
+        if (!$repository->submitFeedback($runId, $restaurantId, $userId, $rating, $comment, $assessmentVersionHash)) {
             hacera_ai_json(['success' => false, 'message' => 'Feedback could not be saved.'], 500);
         }
         hacera_ai_json(['success' => true, 'message' => 'Thank you for your feedback.']);

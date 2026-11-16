@@ -96,7 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['order_id']) && $rest_
         $upd = $conn->prepare(
             "UPDATE orders
              SET payment_status = 'paid', payment_verified_at = NOW()
-             WHERE id = ? AND restaurant_id = ? AND payment_status != 'paid'"
+             WHERE id = ? AND restaurant_id = ? AND payment_status != 'paid' AND payment_method = 'cash'"
         );
         if ($upd) {
             $upd->bind_param("ii", $order_id, $rest_id);
@@ -118,7 +118,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['order_id']) && $rest_
 
     if (in_array($new_status, $allowed, true)) {
         $upd = $conn->prepare(
-            "UPDATE orders SET order_status = ? WHERE id = ? AND restaurant_id = ?"
+            "UPDATE orders SET order_status = ? WHERE id = ? AND restaurant_id = ? AND (payment_status = 'paid' OR payment_method = 'cash')"
         );
         if ($upd) {
             $upd->bind_param("sii", $new_status, $order_id, $rest_id);
@@ -152,6 +152,7 @@ if ($rest_id) {
         FROM orders o
         LEFT JOIN users u ON o.customer_id = u.id
         WHERE o.restaurant_id = {$rest_id}
+          AND (o.payment_status IN ('paid','awaiting_cash') OR o.payment_method = 'cash')
         {$where_status}
         ORDER BY o.created_at DESC
         LIMIT 100
@@ -167,7 +168,7 @@ $counts = [];
 if ($rest_id) {
     $cnt = $conn->query(
         "SELECT order_status, COUNT(*) AS c FROM orders
-         WHERE restaurant_id = {$rest_id} GROUP BY order_status"
+         WHERE restaurant_id = {$rest_id} AND (payment_status IN ('paid','awaiting_cash') OR payment_method = 'cash') GROUP BY order_status"
     );
     if ($cnt) {
         while ($row = $cnt->fetch_assoc()) $counts[$row['order_status']] = (int)$row['c'];

@@ -416,6 +416,7 @@ function getSidebarMenu($roleId) {
                     ['icon' => 'fas fa-star',               'label' => 'Reviews & Ratings', 'url' => BASE_URL . 'dashboard/business_owner/operations_manager.php?tab=reviews'],
                     ['icon' => 'fas fa-shopping-basket',    'label' => 'Grocery Lists',     'url' => BASE_URL . 'dashboard/business_owner/operations_manager.php?tab=requisitions'],
                     ['icon' => 'fas fa-receipt',            'label' => 'Expenses',          'url' => BASE_URL . 'dashboard/business_owner/operations_manager.php?tab=expenses'],
+                    ['icon' => 'fas fa-file-invoice-dollar','label' => 'Reports & Billing', 'url' => BASE_URL . 'dashboard/business_owner/billing.php'],
                     ['icon' => 'fas fa-certificate',        'label' => 'Halal Certification','url' => BASE_URL . 'dashboard/business_owner/halal_certification.php'],
                 ];
             }
@@ -442,6 +443,7 @@ function getSidebarMenu($roleId) {
             // Full owner sidebar
             return [
                 ['icon' => 'fas fa-chart-line',  'label' => 'Owner Dashboard',    'url' => BASE_URL . 'dashboard/business_owner/owner_dashboard.php'],
+                ['icon' => 'fas fa-file-invoice-dollar','label' => 'Reports & Billing', 'url' => BASE_URL . 'dashboard/business_owner/billing.php'],
                 ['icon' => 'fas fa-store',       'label' => 'My Restaurant',      'url' => BASE_URL . 'dashboard/business_owner/restaurant.php'],
                 ['icon' => 'fas fa-users-cog',   'label' => 'Staff Roles',        'url' => BASE_URL . 'dashboard/business_owner/staff_roles.php'],
                 ['icon' => 'fas fa-inbox',       'label' => 'Staff Applications', 'url' => BASE_URL . 'dashboard/business_owner/staff_applications.php'],

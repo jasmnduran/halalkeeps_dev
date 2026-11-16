@@ -18,6 +18,7 @@
  * Returns JSON: { success, message, order_id?, order_number? }
  */
 require_once __DIR__ . '/../../../config/app.php';
+require_once __DIR__ . '/../../../includes/MenuWorkflowService.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 
@@ -87,8 +88,8 @@ foreach ($items_input as $row) {
     if (!$mid) continue;
 
     $mi_stmt = $conn->prepare(
-        "SELECT id, name, price, category FROM menu_items
-         WHERE id = ? AND restaurant_id = ? AND is_available = 1 AND approval_status = 'approved'"
+        "SELECT mi.id, mi.name, mi.price, mi.category FROM menu_items mi
+         WHERE mi.id = ? AND mi.restaurant_id = ? AND mi.is_available = 1 AND " . MenuWorkflowService::customerEligibilitySql('mi')
     );
     if (!$mi_stmt) continue;
     $mi_stmt->bind_param('ii', $mid, $rest_id);

@@ -1,5 +1,7 @@
 <?php
 require_once __DIR__ . '/../../config/app.php';
+require_once __DIR__ . '/../../includes/MenuWorkflowService.php';
+require_once __DIR__ . '/../../includes/RevenuePaymentService.php';
 requireLogin();
 requireRole([ROLE_CUSTOMER]);
 
@@ -8,37 +10,15 @@ $page_heading = 'Halal Restaurants';
 $is_dashboard = true;
 $breadcrumbs = [['label' => 'Dashboard', 'url' => BASE_URL . 'dashboard/customer/'], ['label' => 'Restaurants']];
 $user_id = $_SESSION['user_id'];
+$customerBillingSettings = (new RevenuePaymentService($conn))->billingSettings();
 $action = $_GET['action'] ?? 'list';
 $success = '';
 
-// Handle order placement
+// Customer orders are created only by verified PayMongo fulfillment in
+// api/place_order.php. This legacy form route deliberately never writes orders.
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
-    $restaurant_id    = intval($_POST['restaurant_id']);
-    $items            = sanitize($_POST['items_json']        ?? '[]');
-    $total            = floatval($_POST['total_amount']      ?? 0);
-    $delivery_address = sanitize($_POST['delivery_address']  ?? '');
-    $payment_method   = sanitize($_POST['payment_method']    ?? 'cash');
-    $notes            = sanitize($_POST['notes']             ?? '');
-    $service_type_raw = sanitize($_POST['service_type']      ?? 'delivery');
-    $order_number     = generateReference('ORD');
-    $allowed_svc      = ['dine_in', 'takeout', 'delivery'];
-    if (!in_array($service_type_raw, $allowed_svc, true)) $service_type_raw = 'delivery';
-
-    $stmt = $conn->prepare("INSERT INTO orders (order_number, customer_id, restaurant_id, items_json, subtotal, total_amount, delivery_address, service_type, payment_method, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    $stmt->bind_param("siisddssss", $order_number, $user_id, $restaurant_id, $items, $total, $total, $delivery_address, $service_type_raw, $payment_method, $notes);
-    
-    if ($stmt->execute()) {
-        // Notify restaurant owner
-        $owner = $conn->query("SELECT business_owner_id FROM halal_restaurants WHERE id = $restaurant_id")->fetch_assoc();
-        if ($owner) {
-            createNotification($conn, $owner['business_owner_id'], 'New Order: ' . $order_number,
-                'You have a new order from ' . $_SESSION['full_name'] . '!', 'action_required',
-                BASE_URL . 'dashboard/business_owner/manage_orders.php');
-        }
-        $success = 'Order ' . $order_number . ' placed successfully!';
-    }
+    $success = 'Orders are created only after PayMongo verifies payment. Please use the secure checkout.';
 }
-
 // Handle review submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_review'])) {
     $restaurant_id = intval($_POST['restaurant_id']);
@@ -529,7 +509,7 @@ require_once __DIR__ . '/../../includes/header.php';
         WHERE hr.id = $rid
     ")->fetch_assoc();
     // Fetch all items: available ones first, unavailable shown as Sold Out
-    $menu = $conn->query("SELECT * FROM menu_items WHERE restaurant_id = $rid AND approval_status = 'approved' ORDER BY is_available DESC, category, name")->fetch_all(MYSQLI_ASSOC);
+    $menu = $conn->query("SELECT mi.* FROM menu_items mi WHERE mi.restaurant_id = $rid AND " . MenuWorkflowService::customerEligibilitySql('mi') . " ORDER BY mi.is_available DESC, mi.category, mi.name")->fetch_all(MYSQLI_ASSOC);
 
     // Ingredient transparency: load recipe ingredients for each menu item
     $menu_ingredients_ord = [];
@@ -1010,15 +990,26 @@ if (!function_exists('halalLabelOrd')) {
                 <div id="cartItems" style="display:none;margin-bottom:14px;">
                     <div id="cartList" style="display:flex;flex-direction:column;gap:8px;max-height:240px;overflow-y:auto;padding-right:4px;"></div>
 
-                    <!-- Order breakdown: subtotal + fee + grand total -->
+                    <!-- Order breakdown: subtotal, transparent charges, and grand total -->
                     <div style="border-top:2px solid var(--neutral-100);margin-top:12px;padding-top:10px;">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                             <span style="font-size:0.82rem;color:var(--neutral-500);">Subtotal</span>
                             <span id="cartSubtotal" style="font-size:0.82rem;color:var(--neutral-600);font-weight:600;">₱0.00</span>
                         </div>
-                        <div id="deliveryFeeRow" style="display:none;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                            <span style="font-size:0.82rem;color:var(--neutral-500);">🛵 Delivery Fee</span>
-                            <span style="font-size:0.82rem;color:var(--neutral-600);font-weight:600;">₱50.00</span>
+                        <div id="additionalChargesLabel" style="display:flex;justify-content:space-between;align-items:center;margin:8px 0 3px;">
+                            <span style="font-size:0.78rem;font-weight:700;color:var(--neutral-600);">Additional charges</span>
+                            <span id="additionalChargesTotal" style="font-size:0.78rem;color:var(--neutral-600);font-weight:700;">₱0.00</span>
+                        </div>
+                        <div id="deliveryFeeRow" style="display:none;justify-content:space-between;align-items:center;margin:3px 0;padding-left:8px;">
+                            <span style="font-size:0.82rem;color:var(--neutral-500);">🛵 Delivery fee</span>
+                            <span id="deliveryFeeAmount" style="font-size:0.82rem;color:var(--neutral-600);font-weight:600;">₱0.00</span>
+                        </div>
+                        <div id="platformFeeRow" style="display:none;justify-content:space-between;align-items:center;margin:3px 0;padding-left:8px;">
+                            <span id="platformFeeLabel" style="font-size:0.82rem;color:var(--neutral-500);">Platform fee</span>
+                            <span id="platformFeeAmount" style="font-size:0.82rem;color:var(--neutral-600);font-weight:600;">₱0.00</span>
+                        </div>
+                        <div id="noAdditionalChargesRow" style="display:flex;justify-content:space-between;align-items:center;margin:3px 0 5px;padding-left:8px;">
+                            <span style="font-size:0.78rem;color:var(--neutral-400);">No additional charges</span>
                         </div>
                         <div style="display:flex;justify-content:space-between;align-items:center;padding-top:6px;border-top:1px dashed var(--neutral-200);">
                             <span style="font-weight:700;color:var(--neutral-700);">Total</span>
@@ -1026,7 +1017,6 @@ if (!function_exists('halalLabelOrd')) {
                         </div>
                     </div>
                 </div>
-
                 <!-- Delivery section wrapper — shown when cart has items -->
                 <div id="deliverySection" style="display:none;">
 
@@ -1126,14 +1116,8 @@ if (!function_exists('halalLabelOrd')) {
                     <div class="form-group">
                         <label style="font-size:0.82rem;font-weight:700;color:var(--neutral-700);">Payment Method <span style="color:var(--danger);">*</span></label>
                         <div style="display:flex;flex-direction:column;gap:8px;" id="paymentMethods">
-                            <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid var(--primary-500);border-radius:10px;cursor:pointer;transition:border-color .15s;" id="pmLabel_cash">
-                                <input type="radio" name="payment_method_ui" value="cash" checked style="accent-color:var(--primary-600);">
-                                <i class="fas fa-money-bill-wave" style="color:#16a34a;font-size:1rem;"></i>
-                                <span style="font-size:0.88rem;font-weight:600;">Cash</span>
-                                <span style="margin-left:auto;font-size:0.72rem;color:#6b7280;background:#dcfce7;padding:2px 8px;border-radius:99px;">Pay at Cashier</span>
-                            </label>
                             <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #e2e8f0;border-radius:10px;cursor:pointer;transition:border-color .15s;" id="pmLabel_gcash">
-                                <input type="radio" name="payment_method_ui" value="gcash" style="accent-color:var(--primary-600);">
+                                <input type="radio" name="payment_method_ui" value="gcash" checked style="accent-color:var(--primary-600);">
                                 <i class="fas fa-mobile-alt" style="color:#1d4ed8;font-size:1rem;"></i>
                                 <span style="font-size:0.88rem;font-weight:600;">GCash</span>
                                 <span style="margin-left:auto;font-size:0.72rem;color:#6b7280;background:#eff6ff;padding:2px 8px;border-radius:99px;">via PayMongo</span>
@@ -1146,8 +1130,8 @@ if (!function_exists('halalLabelOrd')) {
                             </label>
                         </div>
                         <!-- Payment method notice for delivery orders -->
-                        <div id="deliveryPayNotice" style="display:none;margin-top:8px;padding:8px 10px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:6px;font-size:0.75rem;color:#92400e;">
-                            <i class="fas fa-info-circle"></i> <strong>Delivery orders</strong> require online payment (GCash or Bank Transfer). Cash is only available for Dine-in and Takeout.
+                        <div id="deliveryPayNotice" style="display:block;margin-top:8px;padding:8px 10px;background:#eff6ff;border-left:3px solid #2563eb;border-radius:6px;font-size:0.75rem;color:#1e3a8a;">
+                            <i class="fas fa-shield-alt"></i> <strong>Secure checkout:</strong> your order is created only after PayMongo verifies payment.
                         </div>
                     </div>
 
@@ -1175,6 +1159,8 @@ if (!function_exists('halalLabelOrd')) {
 const RESTAURANT_ID  = <?= (int)$r['id'] ?>;
 const AJAX_URL       = '<?= BASE_URL ?>dashboard/customer/api/place_order.php';
 const DELIVERY_FEE   = 50; // flat ₱50 delivery fee
+const PLATFORM_FEE_RATE = <?= json_encode((float)$customerBillingSettings['platform_fee_rate']) ?>;
+const PLATFORM_FEE_LABEL = <?= json_encode((string)$customerBillingSettings['platform_fee_label']) ?>;
 
 /* ── Cart state ────────────────────────────────────────────────────────────── */
 const cart = new Map();
@@ -1188,11 +1174,16 @@ const cartTotalEl    = document.getElementById('cartTotal');
 const cartBadgeEl    = document.getElementById('cartBadge');
 const deliverySect   = document.getElementById('deliverySection');
 const deliveryFeeRow = document.getElementById('deliveryFeeRow');
+const deliveryFeeAmountEl = document.getElementById('deliveryFeeAmount');
+const platformFeeRow = document.getElementById('platformFeeRow');
+const platformFeeLabelEl = document.getElementById('platformFeeLabel');
+const platformFeeAmountEl = document.getElementById('platformFeeAmount');
+const additionalChargesTotalEl = document.getElementById('additionalChargesTotal');
+const noAdditionalChargesRow = document.getElementById('noAdditionalChargesRow');
 const orderNotesEl   = document.getElementById('orderNotes');
 const placeOrderBtn  = document.getElementById('placeOrderBtn');
 const orderToastEl   = document.getElementById('orderToast');
 const addressBlock   = document.getElementById('addressBlock');
-const cashLabelEl    = document.getElementById('cashLabel');
 const serviceTypeErr = document.getElementById('serviceTypeError');
 
 /* ── Address field refs ────────────────────────────────────────────────────── */
@@ -1251,35 +1242,14 @@ function applyServiceType(type) {
     // Show / hide delivery fee row and recompute total
     renderCart();
 
-    // Payment method gating:
-    // delivery → hide Cash, force GCash or Bank Transfer
-    // dine_in / takeout → show Cash, re-select it
-    const cashLabel    = document.getElementById('pmLabel_cash');
-    const gcashRadio   = document.querySelector('input[name="payment_method_ui"][value="gcash"]');
-    const cashRadio    = document.querySelector('input[name="payment_method_ui"][value="cash"]');
-    const pmNotice     = document.getElementById('deliveryPayNotice');
-
-    if (type === 'delivery') {
-        // Hide cash option for delivery
-        if (cashLabel)  cashLabel.style.display  = 'none';
-        if (pmNotice)   pmNotice.style.display   = 'block';
-        // If cash is currently selected, switch to gcash
-        if (cashRadio && cashRadio.checked) {
-            if (gcashRadio) {
-                gcashRadio.checked = true;
-                gcashRadio.dispatchEvent(new Event('change'));
-            }
-        }
-    } else {
-        // Show cash option for dine-in and takeout
-        if (cashLabel)  cashLabel.style.display  = 'flex';
-        if (pmNotice)   pmNotice.style.display   = 'none';
-        if (cashRadio) {
-            cashRadio.checked = true;
-            cashRadio.dispatchEvent(new Event('change'));
-        }
+    // All customer service types require an online PayMongo checkout.
+    const gcashRadio = document.querySelector('input[name="payment_method_ui"][value="gcash"]');
+    const pmNotice = document.getElementById('deliveryPayNotice');
+    if (pmNotice) pmNotice.style.display = 'block';
+    if (!document.querySelector('input[name="payment_method_ui"]:checked') && gcashRadio) {
+        gcashRadio.checked = true;
+        gcashRadio.dispatchEvent(new Event('change'));
     }
-
     // Hide validation error if type is now selected
     if (serviceTypeErr) serviceTypeErr.style.display = 'none';
 }
@@ -1326,17 +1296,19 @@ if (starPicker) {
 }
 document.querySelectorAll('input[name="payment_method_ui"]').forEach(radio => {
     radio.addEventListener('change', () => {
-        ['cash','gcash','bank_transfer'].forEach(m => {
+        ['gcash','bank_transfer'].forEach(m => {
             const lbl = document.getElementById('pmLabel_' + m);
             if (lbl) lbl.style.borderColor = '#e2e8f0';
         });
         const lbl = document.getElementById('pmLabel_' + radio.value);
         if (lbl) lbl.style.borderColor = 'var(--primary-500)';
+        renderCart();
     });
     // Init highlight for checked
     if (radio.checked) {
         const lbl = document.getElementById('pmLabel_' + radio.value);
         if (lbl) lbl.style.borderColor = 'var(--primary-500)';
+        renderCart();
     }
 });
 
@@ -1422,15 +1394,26 @@ function renderCart() {
         cart.delete(b.dataset.id); renderCart();
     }));
 
-    // Calculate total including delivery fee when applicable
-    const isDelivery  = getServiceType() === 'delivery';
-    const fee         = isDelivery ? DELIVERY_FEE : 0;
-    const grandTotal  = subtotal + fee;
+    // Charges shown here mirror the server-authoritative total calculation.
+    const isDelivery = getServiceType() === 'delivery';
+    const deliveryFee = isDelivery ? DELIVERY_FEE : 0;
+    const paymentMethod = document.querySelector('input[name="payment_method_ui"]:checked')?.value ?? 'gcash';
+    const onlinePayment = ['gcash', 'bank_transfer', 'paymongo', 'card'].includes(paymentMethod);
+    const platformFee = onlinePayment && PLATFORM_FEE_RATE > 0
+        ? Math.round((subtotal + deliveryFee) * PLATFORM_FEE_RATE * 100) / 100
+        : 0;
+    const additionalCharges = deliveryFee + platformFee;
+    const grandTotal = subtotal + additionalCharges;
 
     if (cartSubtotalEl) cartSubtotalEl.textContent = '₱' + subtotal.toFixed(2);
-    if (deliveryFeeRow) deliveryFeeRow.style.display = isDelivery ? 'flex' : 'none';
+    if (deliveryFeeRow) deliveryFeeRow.style.display = deliveryFee > 0 ? 'flex' : 'none';
+    if (deliveryFeeAmountEl) deliveryFeeAmountEl.textContent = '₱' + deliveryFee.toFixed(2);
+    if (platformFeeRow) platformFeeRow.style.display = platformFee > 0 ? 'flex' : 'none';
+    if (platformFeeLabelEl) platformFeeLabelEl.textContent = PLATFORM_FEE_LABEL;
+    if (platformFeeAmountEl) platformFeeAmountEl.textContent = '₱' + platformFee.toFixed(2);
+    if (additionalChargesTotalEl) additionalChargesTotalEl.textContent = '₱' + additionalCharges.toFixed(2);
+    if (noAdditionalChargesRow) noAdditionalChargesRow.style.display = additionalCharges > 0 ? 'none' : 'flex';
     cartTotalEl.textContent = '₱' + grandTotal.toFixed(2);
-
     const hasItems = cart.size > 0;
     cartEmptyEl.style.display  = hasItems ? 'none'  : 'block';
     cartItemsEl.style.display  = hasItems ? 'block' : 'none';
@@ -1477,10 +1460,14 @@ if (placeOrderBtn) {
             if (!province) { showToast('Please enter your province.', true);               addrProvince.focus(); return; }
         }
 
-        const paymentMethod = document.querySelector('input[name="payment_method_ui"]:checked')?.value ?? 'cash';
+        const paymentMethod = document.querySelector('input[name="payment_method_ui"]:checked')?.value ?? 'gcash';
         const subtotal      = [...cart.values()].reduce((s, i) => s + i.price * i.qty, 0);
-        const fee           = serviceType === 'delivery' ? DELIVERY_FEE : 0;
-        const grandTotal    = subtotal + fee;
+const fee           = serviceType === 'delivery' ? DELIVERY_FEE : 0;
+        const onlinePayment = ['gcash', 'bank_transfer', 'paymongo', 'card'].includes(paymentMethod);
+        const platformFee   = onlinePayment && PLATFORM_FEE_RATE > 0
+            ? Math.round((subtotal + fee) * PLATFORM_FEE_RATE * 100) / 100
+            : 0;
+        const grandTotal    = subtotal + fee + platformFee;
         const itemsArray    = [...cart.values()].map(i => ({ id: i.id, name: i.name, price: i.price, qty: i.qty }));
 
         placeOrderBtn.disabled = true;

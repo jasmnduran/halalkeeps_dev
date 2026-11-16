@@ -257,6 +257,9 @@ $admin_current = basename($_SERVER['PHP_SELF']);
             <a href="<?= BASE_URL ?>admin/settings.php" class="admin-nav-link <?= $admin_current === 'settings.php' ? 'active' : '' ?>">
                 <i class="fas fa-cog"></i> System Settings
             </a>
+            <a href="<?= BASE_URL ?>admin/billing_settings.php" class="admin-nav-link <?= $admin_current === 'billing_settings.php' ? 'active' : '' ?>">
+                <i class="fas fa-file-invoice-dollar"></i> Revenue &amp; Billing
+            </a>
             <a href="<?= BASE_URL ?>dashboard/president/" class="admin-nav-link">
                 <i class="fas fa-arrow-left"></i> Back to Portal
             </a>

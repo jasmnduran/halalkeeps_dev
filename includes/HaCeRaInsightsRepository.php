@@ -18,17 +18,17 @@ final class HaCeRaInsightsRepository
         $stmt->execute();
         $exists = (int)($stmt->get_result()->fetch_assoc()['c'] ?? 0) === 1;
         $stmt->close();
-        return $exists;
+        return $exists && $this->hasColumn('hacera_ai_runs', 'assessment_version_hash');
     }
 
-    public function findReusableRun(int $restaurantId, string $inputHash): ?array
+    public function findReusableRun(int $restaurantId, string $inputHash, string $assessmentVersionHash): ?array
     {
         $stmt = $this->conn->prepare(
             "SELECT id, status, requested_at, completed_at FROM hacera_ai_runs
-             WHERE restaurant_id = ? AND input_hash = ? AND status IN ('queued','processing','completed')
+             WHERE restaurant_id = ? AND input_hash = ? AND assessment_version_hash = ? AND status IN ('queued','processing','completed')
              ORDER BY id DESC LIMIT 1"
         );
-        $stmt->bind_param('is', $restaurantId, $inputHash);
+        $stmt->bind_param('iss', $restaurantId, $inputHash, $assessmentVersionHash);
         $stmt->execute();
         $row = $stmt->get_result()->fetch_assoc() ?: null;
         $stmt->close();
@@ -48,16 +48,16 @@ final class HaCeRaInsightsRepository
         return $count;
     }
 
-    public function createRun(int $restaurantId, int $userId, string $inputHash, string $provider, string $model, string $criteriaVersion): int
+    public function createRun(int $restaurantId, int $userId, string $inputHash, string $assessmentVersionHash, string $provider, string $model, string $criteriaVersion): int
     {
         $status = 'queued';
         $promptVersion = HaCeRaAIService::PROMPT_VERSION;
         $stmt = $this->conn->prepare(
             'INSERT INTO hacera_ai_runs
-             (restaurant_id, requested_by, status, input_hash, provider, model, prompt_version, criteria_version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+             (restaurant_id, requested_by, status, input_hash, assessment_version_hash, provider, model, prompt_version, criteria_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
         );
-        $stmt->bind_param('iissssss', $restaurantId, $userId, $status, $inputHash, $provider, $model, $promptVersion, $criteriaVersion);
+        $stmt->bind_param('iisssssss', $restaurantId, $userId, $status, $inputHash, $assessmentVersionHash, $provider, $model, $promptVersion, $criteriaVersion);
         if (!$stmt->execute()) {
             $message = $stmt->error;
             $stmt->close();
@@ -184,10 +184,15 @@ final class HaCeRaInsightsRepository
     }
 
     /** @return array<string,mixed>|null */
-    public function getRun(int $runId, int $restaurantId): ?array
+    public function getRun(int $runId, int $restaurantId, ?string $assessmentVersionHash = null): ?array
     {
-        $stmt = $this->conn->prepare('SELECT * FROM hacera_ai_runs WHERE id = ? AND restaurant_id = ? LIMIT 1');
-        $stmt->bind_param('ii', $runId, $restaurantId);
+        if ($assessmentVersionHash === null) {
+            $stmt = $this->conn->prepare('SELECT * FROM hacera_ai_runs WHERE id = ? AND restaurant_id = ? LIMIT 1');
+            $stmt->bind_param('ii', $runId, $restaurantId);
+        } else {
+            $stmt = $this->conn->prepare('SELECT * FROM hacera_ai_runs WHERE id = ? AND restaurant_id = ? AND assessment_version_hash = ? LIMIT 1');
+            $stmt->bind_param('iis', $runId, $restaurantId, $assessmentVersionHash);
+        }
         $stmt->execute();
         $run = $stmt->get_result()->fetch_assoc() ?: null;
         $stmt->close();
@@ -198,16 +203,16 @@ final class HaCeRaInsightsRepository
     }
 
     /** @return array<int,array<string,mixed>> */
-    public function history(int $restaurantId, int $limit = 10): array
+    public function history(int $restaurantId, string $assessmentVersionHash, int $limit = 10): array
     {
         $limit = max(1, min(50, $limit));
         $stmt = $this->conn->prepare(
             "SELECT r.id, r.status, r.input_hash, r.summary, r.validated_finding_count, r.rejected_finding_count, r.requested_at, r.completed_at, r.criteria_version,
                     SUM(CASE WHEN f.requires_expert_review = 1 THEN 1 ELSE 0 END) AS expert_review_count
              FROM hacera_ai_runs r LEFT JOIN hacera_ai_findings f ON f.run_id = r.id
-             WHERE r.restaurant_id = ? GROUP BY r.id ORDER BY r.id DESC LIMIT {$limit}"
+             WHERE r.restaurant_id = ? AND r.assessment_version_hash = ? GROUP BY r.id ORDER BY r.id DESC LIMIT {$limit}"
         );
-        $stmt->bind_param('i', $restaurantId);
+        $stmt->bind_param('is', $restaurantId, $assessmentVersionHash);
         $stmt->execute();
         $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
         $stmt->close();
@@ -217,28 +222,30 @@ final class HaCeRaInsightsRepository
     /** @return array<string,mixed>|null */
     public function claimNextQueued(): ?array
     {
-        $row = $this->conn->query("SELECT id, restaurant_id FROM hacera_ai_runs WHERE status = 'queued' ORDER BY id ASC LIMIT 1")->fetch_assoc();
+        $row = $this->conn->query("SELECT id, restaurant_id, assessment_version_hash FROM hacera_ai_runs WHERE status = 'queued' ORDER BY id ASC LIMIT 1")->fetch_assoc();
         if (!$row || !$this->markProcessing((int)$row['id'])) return null;
-        return ['id' => (int)$row['id'], 'restaurant_id' => (int)$row['restaurant_id']];
+        return ['id' => (int)$row['id'], 'restaurant_id' => (int)$row['restaurant_id'], 'assessment_version_hash' => (string)$row['assessment_version_hash']];
     }
 
-    public function updateAction(int $actionId, int $restaurantId, int $userId, string $status): bool
+    public function updateAction(int $actionId, int $restaurantId, int $userId, string $status, string $assessmentVersionHash): bool
     {
         $allowed = ['not_started', 'in_progress', 'resolved_by_owner', 'needs_expert_review'];
         if (!in_array($status, $allowed, true)) return false;
         $stmt = $this->conn->prepare(
-            'UPDATE hacera_ai_actions SET action_status = ?, status_updated_by = ?, status_updated_at = NOW()
-             WHERE id = ? AND restaurant_id = ?'
+            'UPDATE hacera_ai_actions a JOIN hacera_ai_runs r ON r.id = a.run_id
+             SET a.action_status = ?, a.status_updated_by = ?, a.status_updated_at = NOW()
+             WHERE a.id = ? AND a.restaurant_id = ? AND r.assessment_version_hash = ?'
         );
-        $stmt->bind_param('siii', $status, $userId, $actionId, $restaurantId);
+        $stmt->bind_param('siiis', $status, $userId, $actionId, $restaurantId, $assessmentVersionHash);
         $stmt->execute();
         $updated = $stmt->affected_rows === 1;
         $stmt->close();
         return $updated;
     }
 
-    public function submitFeedback(int $runId, int $restaurantId, int $userId, int $rating, string $comment): bool
+    public function submitFeedback(int $runId, int $restaurantId, int $userId, int $rating, string $comment, string $assessmentVersionHash): bool
     {
+        if ($this->getRun($runId, $restaurantId, $assessmentVersionHash) === null) return false;
         $rating = max(1, min(5, $rating));
         $comment = mb_substr(strip_tags($comment), 0, 1000, 'UTF-8');
         $stmt = $this->conn->prepare(
@@ -279,5 +286,13 @@ final class HaCeRaInsightsRepository
         $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
         $stmt->close();
         return $rows;
+    }
+    private function hasColumn(string $table, string $column): bool
+    {
+        $stmt = $this->conn->prepare('SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1');
+        $stmt->bind_param('ss', $table, $column);
+        $stmt->execute(); $exists = $stmt->get_result()->num_rows === 1;
+        $stmt->close();
+        return $exists;
     }
 }

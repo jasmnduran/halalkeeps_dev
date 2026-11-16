@@ -97,6 +97,7 @@ $stmt = $conn->prepare("
     FROM orders
     WHERE id IN ($placeholders)
       AND restaurant_id = ?
+      AND (payment_status IN ('paid','awaiting_cash') OR payment_method = 'cash')
 ");
 $stmt->bind_param($types, ...$params);
 $stmt->execute();

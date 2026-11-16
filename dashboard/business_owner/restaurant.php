@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../../config/app.php';
+require_once __DIR__ . '/../../includes/MenuWorkflowService.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 
@@ -25,6 +26,7 @@ if ((int)($_SESSION['role_id'] ?? 0) === ROLE_BUSINESS_OWNER) {
 $user_id    = (int)$_SESSION['user_id'];
 $staff_key  = $_SESSION['staff_role_key'] ?? null;   // null = actual owner
 $is_owner   = ($staff_key === null);
+$menu_workflow_csrf = MenuWorkflowService::ensureCsrfToken();
 
 // Ops manager: verify active assignment and resolve their restaurant_id upfront
 if (!$is_owner) {
@@ -515,6 +517,7 @@ require_once __DIR__ . '/../../includes/header.php';
 
     const ADD_URL       = '<?= BASE_URL ?>dashboard/business_owner/api/add_menu_item.php';
     const UPDATE_URL    = '<?= BASE_URL ?>dashboard/business_owner/api/update_menu_item.php';
+    const MENU_WORKFLOW_CSRF = <?= json_encode($menu_workflow_csrf) ?>;
     const CURRENCY      = '₱';
     let   dishCount     = 0;
 
@@ -681,6 +684,7 @@ require_once __DIR__ . '/../../includes/header.php';
             const url    = isEdit ? UPDATE_URL : ADD_URL;
 
             const fd = new FormData();
+            fd.append('csrf_token', MENU_WORKFLOW_CSRF);
             if (isEdit) fd.append('item_id', row.dataset.editId);
             fd.append('dish_name',         dishName);
             fd.append('dish_price',        row.querySelector('[name^="dish_price_"]')?.value   ?? '0');

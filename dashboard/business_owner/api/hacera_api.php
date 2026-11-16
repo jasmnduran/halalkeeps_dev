@@ -10,6 +10,8 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../../../config/app.php';
 require_once __DIR__ . '/../../../includes/HaCeRaCalculator.php';
+require_once __DIR__ . '/../../../includes/RevenuePaymentService.php';
+require_once __DIR__ . '/../../../vendor/autoload.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -20,13 +22,6 @@ if (!isLoggedIn() || (int)($_SESSION['role_id'] ?? 0) !== ROLE_BUSINESS_OWNER) {
     exit();
 }
 
-// Staff sub-roles (cashier / chef / ops) may not use HaCeRa
-$staff_key = $_SESSION['staff_role_key'] ?? null;
-if ($staff_key !== null) {
-    http_response_code(403);
-    echo json_encode(['success' => false, 'message' => 'HaCeRa is only accessible by the restaurant owner.']);
-    exit();
-}
 
 $user_id = (int)$_SESSION['user_id'];
 
@@ -158,6 +153,11 @@ function buildScorePayload(mysqli $conn, int $rest_id): array
         'module_scores' => $module_scores,
     ];
 }
+function clientScorePayload(mysqli $conn, int $userId, int $restaurantId): array {
+    // The checklist Gap Analysis is a free assessment result. Premium endpoints
+    // separately enforce payment for AI insights and the saved full-report PDF.
+    return buildScorePayload($conn, $restaurantId);
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ACTION: save_response  (yesno toggle)
@@ -208,7 +208,7 @@ if ($action === 'save_response') {
         exit();
     }
 
-    $scores = buildScorePayload($conn, $rest_id);
+    $scores = clientScorePayload($conn, $user_id, $rest_id);
     echo json_encode(['success' => true, 'message' => 'Response saved.'] + $scores);
     exit();
 }
@@ -265,7 +265,7 @@ if ($action === 'upload_document') {
     logActivity($conn, $user_id, 'hacera_upload',
         "Uploaded document for item #{$item_id} (restaurant #{$rest_id})", 'hacera');
 
-    $scores = buildScorePayload($conn, $rest_id);
+    $scores = clientScorePayload($conn, $user_id, $rest_id);
     echo json_encode([
         'success'     => true,
         'message'     => 'Document uploaded successfully.',
@@ -312,7 +312,7 @@ if ($action === 'delete_document') {
     $disk_path = UPLOAD_DIR . $doc['file_path'];
     if (file_exists($disk_path)) @unlink($disk_path);
 
-    $scores = buildScorePayload($conn, $rest_id);
+    $scores = clientScorePayload($conn, $user_id, $rest_id);
     echo json_encode(['success' => true, 'message' => 'Document deleted.'] + $scores);
     exit();
 }
@@ -321,7 +321,7 @@ if ($action === 'delete_document') {
 // ACTION: get_scores  (polling / initial page load via AJAX)
 // ══════════════════════════════════════════════════════════════════════════════
 if ($action === 'get_scores') {
-    echo json_encode(['success' => true] + buildScorePayload($conn, $rest_id));
+    echo json_encode(['success' => true] + clientScorePayload($conn, $user_id, $rest_id));
     exit();
 }
 
@@ -329,44 +329,40 @@ if ($action === 'get_scores') {
 // ACTION: generate_pdf  — Inspection Readiness Portfolio
 // ══════════════════════════════════════════════════════════════════════════════
 if ($action === 'generate_pdf') {
-    $scores_data = buildScorePayload($conn, $rest_id);
-    $modules     = HaCeRaCalculator::getModules();
+    // A PDF can only be generated from an entitlement activated by a verified webhook.
+    $purchaseId = (int)($_GET['purchase_id'] ?? $_POST['purchase_id'] ?? 0);
+    $purchase = (new RevenuePaymentService($conn))->authorizeReportDownload($user_id, $rest_id, 'hacera', $purchaseId);
+    if (!$purchase) {
+        http_response_code(402);
+        echo json_encode(['success'=>false,'message'=>'Purchase and verified PayMongo payment are required before downloading this report.']);
+        exit();
+    }
+    $snapshot = json_decode((string)$purchase['snapshot_json'], true);
+    if (!is_array($snapshot) || ($snapshot['kind'] ?? '') !== 'hacera') {
+        http_response_code(500);
+        echo json_encode(['success'=>false,'message'=>'The saved HaCeRa report snapshot is unavailable.']);
+        exit();
+    }
 
-    // Load restaurant details
-    $rinfo = $conn->query(
-        "SELECT restaurant_name, address, phone FROM halal_restaurants WHERE id = $rest_id"
-    )->fetch_assoc();
-
-    // Load all responses for this restaurant
-    $resp_res = $conn->query(
-        "SELECT checklist_item_id, response_value, notes FROM business_hacera_responses
-         WHERE restaurant_id = $rest_id"
-    );
+    $scores_data = $snapshot['scores'] ?? [];
+    $modules = HaCeRaCalculator::getModules();
+    $rinfo = $snapshot['restaurant'] ?? [];
     $resp_map = [];
-    if ($resp_res) {
-        while ($r = $resp_res->fetch_assoc()) {
-            $resp_map[(int)$r['checklist_item_id']] = $r;
-        }
+    foreach (($snapshot['responses'] ?? []) as $row) {
+        $resp_map[(int)$row['checklist_item_id']] = $row;
     }
-
-    // Load uploaded docs grouped by item
-    $doc_res = $conn->query(
-        "SELECT checklist_item_id, original_name, file_path, uploaded_at
-         FROM hacera_documents WHERE restaurant_id = $rest_id ORDER BY uploaded_at DESC"
-    );
     $doc_map = [];
-    if ($doc_res) {
-        while ($d = $doc_res->fetch_assoc()) {
-            $doc_map[(int)$d['checklist_item_id']][] = $d;
-        }
+    foreach (($snapshot['documents'] ?? []) as $row) {
+        $doc_map[(int)$row['checklist_item_id']][] = $row;
     }
-
-    // ── Build completed IDs for gap indicators ────────────────────────────
+    // Preserved for the older PDF builder below; the rows come from the saved snapshot.
+    $resp_res = true;
+// ── Build completed IDs for gap indicators ────────────────────────────
     $all_resp  = $resp_res ? array_values(array_map(
         fn($k, $v) => ['checklist_item_id' => $k, 'response_value' => $v['response_value']],
         array_keys($resp_map), $resp_map
     )) : [];
-    $completed_ids = HaCeRaCalculator::buildCompletedIds($all_resp, array_keys($doc_map));
+    $completed_ids = array_map('intval', $snapshot['completed_ids'] ?? []);
 
     $hrp  = $scores_data['hrp'];
     $band = $scores_data['band'];
@@ -594,7 +590,7 @@ db_add_column($conn, 'halal_restaurants', 'hacera_published_at',
         'hrp'          => $hrp,
         'band'         => $scores['band'],
         'published_at' => date('M j, Y g:i A'),
-    ] + $scores);
+    ] + clientScorePayload($conn, $user_id, $rest_id));
     exit();
 }
 

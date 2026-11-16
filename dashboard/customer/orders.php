@@ -21,6 +21,15 @@ $stmt = $conn->prepare(
      FROM orders o
      JOIN halal_restaurants hr ON o.restaurant_id = hr.id
      WHERE o.customer_id = ?
+           AND o.payment_status = 'paid'
+       AND o.payment_verified_at IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM billing_payment_requests b
+           WHERE b.order_id = o.id
+             AND b.provider = 'paymongo'
+             AND b.service_type = 'order'
+             AND b.status = 'paid'
+       )
      ORDER BY o.created_at DESC"
 );
 $stmt->bind_param("i", $user_id);
@@ -145,6 +154,9 @@ require_once __DIR__ . '/../../includes/header.php';
                             <td id="status-cell-<?= $oid ?>"><?= getStatusBadge($status) ?></td>
                             <td style="font-size:0.85rem;color:var(--neutral-500);"><?= formatDateTime($o['created_at']) ?></td>
                             <td style="text-align:center;" id="action-cell-<?= $oid ?>">
+                                <?php if ($o['payment_status'] === 'paid' && !empty($o['receipt_number'])): ?>
+                                    <a class="btn btn-sm" style="margin:0 0 5px;background:#e0f2fe;color:#075985;border:1px solid #7dd3fc;" target="_blank" href="<?= BASE_URL ?>dashboard/customer/order_receipt.php?order_id=<?= $oid ?>"><i class="fas fa-receipt"></i> Receipt</a><br>
+                                <?php endif; ?>
                                 <?php if ($is_ofd): ?>
                                     <button type="button" class="btn btn-sm confirm-received-btn"
                                             style="background:#16a34a;color:#fff;border:none;padding:6px 12px;border-radius:8px;font-weight:600;font-size:0.8rem;cursor:pointer;white-space:nowrap;"

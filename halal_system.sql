@@ -518,15 +518,15 @@ CREATE TABLE `notifications` (
 --
 
 INSERT INTO `notifications` (`id`, `user_id`, `title`, `message`, `type`, `link`, `is_read`, `created_at`) VALUES
-(26, 2, 'New Letter of Intent', 'Jasmine Duran has submitted a Letter of Intent for Halal Keeps', 'action_required', '/halal_final/dashboard/evaluator/verify_loi.php', 0, '2026-04-28 11:26:47'),
-(27, 1, 'LOI Returned', 'Your Letter of Intent has been returned. Please check the feedback and resubmit.', 'warning', '/halal_final/dashboard/business_owner/letter_of_intent.php?action=view&id=7', 1, '2026-04-28 11:28:05'),
-(28, 2, 'New Letter of Intent', 'Jasmine Duran has submitted a Letter of Intent for Halal Keeps', 'action_required', '/halal_final/dashboard/evaluator/verify_loi.php', 0, '2026-04-28 11:28:09'),
-(29, 1, 'LOI Approved ΓÇö Requirements Sent', 'Your Letter of Intent has been approved. The list of requirements you need to submit has been sent. Please review and proceed with your application.', 'success', '/halal_final/dashboard/business_owner/letter_of_intent.php?action=view&id=8', 0, '2026-04-28 11:29:12'),
-(30, 2, 'New HDP Application', 'Jasmine Duran has submitted an HDP application.', 'action_required', '/halal_final/dashboard/evaluator/verify_applications.php', 1, '2026-04-28 11:31:19'),
-(31, 1, 'LOI Approved ΓÇö Requirements Sent', 'Your Letter of Intent has been approved. The list of requirements you need to submit has been sent. Please review and proceed with your application.', 'success', '/halal_final/dashboard/business_owner/letter_of_intent.php?action=view&id=8', 0, '2026-04-28 11:31:25'),
-(32, 1, 'Application Verified', 'Your HDP application has been verified.', 'success', '/halal_final/dashboard/business_owner/applications.php', 1, '2026-04-28 11:33:01'),
-(33, 2, 'New HDP Application', 'Jasmine Duran has submitted an HDP application.', 'action_required', '/halal_final/dashboard/evaluator/verify_applications.php', 1, '2026-04-28 11:33:07'),
-(34, 1, 'Application Verified', 'Your HDP application has been verified.', 'success', '/halal_final/dashboard/business_owner/applications.php', 0, '2026-04-28 11:33:27');
+(26, 2, 'New Letter of Intent', 'Jasmine Duran has submitted a Letter of Intent for Halal Keeps', 'action_required', '/dashboard/evaluator/verify_loi.php', 0, '2026-04-28 11:26:47'),
+(27, 1, 'LOI Returned', 'Your Letter of Intent has been returned. Please check the feedback and resubmit.', 'warning', '/dashboard/business_owner/letter_of_intent.php?action=view&id=7', 1, '2026-04-28 11:28:05'),
+(28, 2, 'New Letter of Intent', 'Jasmine Duran has submitted a Letter of Intent for Halal Keeps', 'action_required', '/dashboard/evaluator/verify_loi.php', 0, '2026-04-28 11:28:09'),
+(29, 1, 'LOI Approved - Requirements Sent', 'Your Letter of Intent has been approved. The list of requirements you need to submit has been sent. Please review and proceed with your application.', 'success', '/dashboard/business_owner/letter_of_intent.php?action=view&id=8', 0, '2026-04-28 11:29:12'),
+(30, 2, 'New HDP Application', 'Jasmine Duran has submitted an HDP application.', 'action_required', '/dashboard/evaluator/verify_applications.php', 1, '2026-04-28 11:31:19'),
+(31, 1, 'LOI Approved - Requirements Sent', 'Your Letter of Intent has been approved. The list of requirements you need to submit has been sent. Please review and proceed with your application.', 'success', '/dashboard/business_owner/letter_of_intent.php?action=view&id=8', 0, '2026-04-28 11:31:25'),
+(32, 1, 'Application Verified', 'Your HDP application has been verified.', 'success', '/dashboard/business_owner/applications.php', 1, '2026-04-28 11:33:01'),
+(33, 2, 'New HDP Application', 'Jasmine Duran has submitted an HDP application.', 'action_required', '/dashboard/evaluator/verify_applications.php', 1, '2026-04-28 11:33:07'),
+(34, 1, 'Application Verified', 'Your HDP application has been verified.', 'success', '/dashboard/business_owner/applications.php', 0, '2026-04-28 11:33:27');
 
 -- --------------------------------------------------------
 

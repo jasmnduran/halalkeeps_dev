@@ -59,7 +59,7 @@ if (!in_array($new_status, $allowed_statuses, true)) {
 
 // Get current order and verify access
 $order_stmt = $conn->prepare("
-    SELECT o.id, o.order_number, o.order_status, o.restaurant_id, o.customer_id,
+    SELECT o.id, o.order_number, o.order_status, o.payment_status, o.payment_method, o.restaurant_id, o.customer_id,
            hr.business_owner_id
     FROM orders o
     JOIN halal_restaurants hr ON o.restaurant_id = hr.id
@@ -104,6 +104,12 @@ if ($role_id === ROLE_BUSINESS_OWNER) {
 if (!$has_access) {
     http_response_code(403);
     echo json_encode(['success' => false, 'message' => 'You do not have access to this order.']);
+    exit;
+}
+
+if (in_array($order['payment_method'], ['gcash', 'bank_transfer', 'paymongo'], true) && $order['payment_status'] !== 'paid') {
+    http_response_code(409);
+    echo json_encode(['success' => false, 'message' => 'This online order cannot be processed until PayMongo verifies the payment.']);
     exit;
 }
 

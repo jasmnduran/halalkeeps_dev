@@ -11,6 +11,7 @@
  */
 require_once __DIR__ . '/../../../config/app.php';
 require_once __DIR__ . '/../../../includes/IngredientInventoryService.php';
+require_once __DIR__ . '/../../../includes/RevenuePaymentService.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]); // Business owner OR staff with role access checked per-action
 
@@ -380,21 +381,50 @@ if ($action === 'save_inventory') {
     }
 
     if ($inv_id > 0) {
-        // Write to both expiration_date (canonical) and expiry_date (legacy) — 12 params: s,s,s,s,i,i,d,s,d,s,i,i
-        $stmt = $conn->prepare("
-            UPDATE kitchen_inventory
-            SET ingredient_name=?, expiration_date=?, expiry_date=?, halal_status=?, is_meat=?,
-                supplier_id=?, quantity=?, unit=?, low_stock_threshold=?, notes=?, updated_at=NOW()
-            WHERE id=? AND restaurant_id=?
-        ");
-        $stmt->bind_param("ssssiidsdsii",
-            $ing_name, $expiration_date, $expiration_date, $halal_status, $is_meat,
-            $supplier_id, $qty, $unit, $threshold, $notes, $inv_id, $rest_id);
-        $ok  = $stmt->execute();
-        $stmt->close();
+        // The master inventory form is the source for a legacy inventory
+        // record. Keep its one-time batch snapshot in the same transaction so
+        // customer reservations never use stale quantities or expiry dates.
+        $inventoryService = null;
+        if (IngredientInventoryService::isFeatureEnabled()) {
+            $candidateService = new IngredientInventoryService($conn);
+            if ($candidateService->schemaReady()) $inventoryService = $candidateService;
+        }
+        if ($inventoryService !== null) $conn->begin_transaction();
+        try {
+            $stmt = $conn->prepare("
+                UPDATE kitchen_inventory
+                SET ingredient_name=?, expiration_date=?, expiry_date=?, halal_status=?, is_meat=?,
+                    supplier_id=?, quantity=?, unit=?, low_stock_threshold=?, notes=?, updated_at=NOW()
+                WHERE id=? AND restaurant_id=?
+            ");
+            if (!$stmt) throw new RuntimeException('Unable to prepare the inventory update.');
+            $stmt->bind_param("ssssiidsdsii",
+                $ing_name, $expiration_date, $expiration_date, $halal_status, $is_meat,
+                $supplier_id, $qty, $unit, $threshold, $notes, $inv_id, $rest_id);
+            $ok = $stmt->execute();
+            $error = $stmt->error;
+            $stmt->close();
+            if (!$ok) throw new RuntimeException($error ?: 'Unable to update inventory.');
+
+            if ($inventoryService !== null) {
+                $inventoryService->synchronizeLegacyBatchFromInventory(
+                    $rest_id, $inv_id, (string)$qty, $unit, $expiration_date, $user_id
+                );
+                $conn->commit();
+            }
+        } catch (Throwable $e) {
+            if ($inventoryService !== null) $conn->rollback();
+            chef_json(false, $e->getMessage());
+        }
         $msg = 'Inventory item updated.';
     } else {
         // 12 params: i,i,s,s,s,s,i,i,d,s,d,s
+        // Count logical ingredient records, not batches. A verified expansion pack is required at capacity.
+        $billing = new RevenuePaymentService($conn);
+        if ($billing->schemaReady()) {
+            $slot = $billing->assertInventorySlotAvailable($rest_id);
+            if (!$slot['success']) chef_json(false, $slot['message'], ['capacity' => $slot['capacity']]);
+        }
         $stmt = $conn->prepare("
             INSERT INTO kitchen_inventory
                 (restaurant_id, logged_by, ingredient_name, expiration_date, expiry_date, halal_status,

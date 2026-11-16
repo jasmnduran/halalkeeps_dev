@@ -4,9 +4,15 @@ declare(strict_types=1);
 require_once __DIR__ . '/../../../config/app.php';
 require_once __DIR__ . '/../../../includes/IngredientInventoryService.php';
 require_once __DIR__ . '/../../../includes/IngredientMenuAIService.php';
+require_once __DIR__ . '/../../../includes/MenuWorkflowService.php';
 
 header('Content-Type: application/json; charset=utf-8');
-function imi_json(bool $success, string $message, array $extra = []): never { echo json_encode(['success' => $success, 'message' => $message] + $extra); exit; }
+function imi_json(bool $success, string $message, $extra = [], int $statusCode = 200): never {
+    if (is_int($extra)) { $statusCode = $extra; $extra = []; }
+    http_response_code($statusCode);
+    echo json_encode(['success' => $success, 'message' => $message] + (is_array($extra) ? $extra : []));
+    exit;
+}
 if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isLoggedIn() || (int)($_SESSION['role_id'] ?? 0) !== ROLE_BUSINESS_OWNER) imi_json(false, 'Access denied.', 403);
 $restaurantId = getSessionRestaurantId($conn); $userId = (int)$_SESSION['user_id']; $staff = $_SESSION['staff_role_key'] ?? null;
 if (!$restaurantId) imi_json(false, 'No active restaurant was found.');
@@ -178,35 +184,23 @@ if ($action === 'confirm_mapping') {
     imi_json(true, $decision === 'confirm' ? 'Chef mapping confirmed.' : 'Chef mapping rejected.');
 }
 
-if ($action === 'approve_recipe_listing') {
-    if (!$isChef) imi_json(false, 'Only the Chef or Business Owner can approve the ingredient listing.', 403);
+if ($action === 'approve_recipe_listing' || $action === 'submit_menu_for_approval') {
+    if (!$isChef) imi_json(false, 'Only the Chef or Business Owner can submit a completed recipe.', [], 403);
+    if (!MenuWorkflowService::validCsrfToken($_POST['csrf_token'] ?? null)) imi_json(false, 'Your session token is invalid. Refresh the page and try again.', [], 419);
     $recipeId = (int)($_POST['recipe_id'] ?? 0);
-    if ($recipeId <= 0) imi_json(false, 'Recipe is required.');
-
-    $check = $conn->prepare("SELECT mr.id,
-        COUNT(ri.id) AS ingredient_count,
-        COALESCE(SUM(CASE WHEN ri.mapping_status IN ('confirmed','rejected') THEN 1 ELSE 0 END),0) AS reviewed_count,
-        COALESCE(SUM(CASE WHEN ri.mapping_status='confirmed' AND ri.inventory_id IS NOT NULL AND ki.id IS NOT NULL THEN 1 ELSE 0 END),0) AS confirmed_count
-        FROM menu_recipes mr
-        LEFT JOIN recipe_ingredients ri ON ri.recipe_id=mr.id AND ri.restaurant_id=mr.restaurant_id
-        LEFT JOIN kitchen_inventory ki ON ki.id=ri.inventory_id AND ki.restaurant_id=mr.restaurant_id
-        WHERE mr.id=? AND mr.restaurant_id=? AND mr.recipe_status='active'
-        GROUP BY mr.id");
-    $check->bind_param('ii', $recipeId, $restaurantId); $check->execute();
-    $recipeCheck = $check->get_result()->fetch_assoc(); $check->close();
-    if (!$recipeCheck) imi_json(false, 'Active recipe not found.');
-    $ingredientCount = (int)$recipeCheck['ingredient_count'];
-    $reviewedCount = (int)$recipeCheck['reviewed_count'];
-    $confirmedCount = (int)$recipeCheck['confirmed_count'];
-    if ($ingredientCount < 1) imi_json(false, 'Add at least one recipe ingredient before approving the listing.');
-    if ($reviewedCount !== $ingredientCount) imi_json(false, 'Review every recipe ingredient before approving the listing. Confirm or explicitly reject each suggestion.');
-    if ($confirmedCount < 1) imi_json(false, 'At least one ingredient must be confirmed before the listing can go live.');
-
-    $publish = $conn->prepare("UPDATE menu_recipes SET customer_visibility_status='published', customer_visible_by=?, customer_visible_at=NOW(), last_updated_by=? WHERE id=? AND restaurant_id=? AND recipe_status='active'");
-    $publish->bind_param('iiii', $userId, $userId, $recipeId, $restaurantId);
-    if (!$publish->execute()) { $error=$publish->error; $publish->close(); imi_json(false, 'Could not approve the ingredient listing.'); }
-    $publish->close();
-    imi_json(true, 'Recipe ingredient listing approved by the Chef and published to customers.', ['recipe_id'=>$recipeId, 'confirmed_count'=>$confirmedCount]);
+    $menuId = (int)($_POST['menu_item_id'] ?? 0);
+    if ($menuId <= 0 && $recipeId > 0) {
+        $menuForRecipe = $conn->prepare("SELECT menu_item_id FROM menu_recipes WHERE id=? AND restaurant_id=? AND recipe_status='active'");
+        $menuForRecipe->bind_param('ii', $recipeId, $restaurantId);
+        $menuForRecipe->execute();
+        $menuId = (int)($menuForRecipe->get_result()->fetch_assoc()['menu_item_id'] ?? 0);
+        $menuForRecipe->close();
+    }
+    if ($menuId <= 0) imi_json(false, 'An active recipe and menu item are required.');
+    $workflow = new MenuWorkflowService($conn);
+    if (!$workflow->schemaReady()) imi_json(false, 'The menu workflow migration has not been applied.');
+    $result = $workflow->submit($restaurantId, $menuId, $userId);
+    imi_json($result['success'], $result['message'], ['errors' => $result['errors'] ?? [], 'availability' => $result['availability'] ?? null]);
 }
 if ($action === 'record_batch') {
     if (!$isChef) imi_json(false,'Only the Chef or Business Owner can record purchased stock.',403);

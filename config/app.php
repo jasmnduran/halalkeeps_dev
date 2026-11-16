@@ -19,6 +19,19 @@ if (PHP_VERSION_ID < 80000) {
     );
 }
 
+// Keep sessions in a protected application-owned directory. This avoids losing
+// authenticated sessions when the shared XAMPP temp directory is not writable
+// by Apache, which otherwise makes valid owner API requests appear unauthorized.
+$appSessionPath = dirname(__DIR__) . '/tmp/sessions';
+if (!is_dir($appSessionPath)) {
+    @mkdir($appSessionPath, 0700, true);
+}
+if (is_dir($appSessionPath) && is_writable($appSessionPath)) {
+    ini_set('session.save_path', $appSessionPath);
+} else {
+    error_log('Halal Keeps session directory is not writable: ' . $appSessionPath);
+}
+ini_set('session.use_strict_mode', '1');
 session_start();
 
 // Force UTF-8 throughout: ini settings, mbstring, and HTTP headers.

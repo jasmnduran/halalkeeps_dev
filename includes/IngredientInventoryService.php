@@ -101,15 +101,18 @@ final class IngredientInventoryService
     }
 
     /** @param array<int,array{id:int,qty:int}> $items @return array{success:bool,message:string} */
-    public function reserveForOrder(int $orderId, int $restaurantId, array $items, ?int $recordedBy = null): array
+    public function reserveForOrder(int $orderId, int $restaurantId, array $items, ?int $recordedBy = null, bool $manageTransaction = true): array
     {
         if (!self::isFeatureEnabled() || !$this->schemaReady()) return ['success' => true, 'message' => 'Ingredient controls are disabled.'];
-        $this->conn->begin_transaction();
+        if ($manageTransaction) $this->conn->begin_transaction();
         try {
             $existing = $this->conn->prepare("SELECT COUNT(*) AS c FROM ingredient_stock_reservations WHERE order_id=? AND reservation_status IN ('active','consumed')");
             $existing->bind_param('i', $orderId); $existing->execute();
             $count = (int)($existing->get_result()->fetch_assoc()['c'] ?? 0); $existing->close();
-            if ($count > 0) { $this->conn->commit(); return ['success' => true, 'message' => 'Inventory is already reserved for this order.']; }
+            if ($count > 0) {
+                if ($manageTransaction) $this->conn->commit();
+                return ['success' => true, 'message' => 'Inventory is already reserved for this order.'];
+            }
             foreach ($items as $item) {
                 $menuId = (int)($item['id'] ?? 0); $portions = (int)($item['qty'] ?? 0);
                 if ($menuId <= 0 || $portions <= 0) throw new RuntimeException('Order has an invalid menu quantity.');
@@ -119,14 +122,13 @@ final class IngredientInventoryService
                     $this->allocateReservation($orderId, $restaurantId, $ingredient, $needed, $recordedBy);
                 }
             }
-            $this->conn->commit();
+            if ($manageTransaction) $this->conn->commit();
             return ['success' => true, 'message' => 'Ingredient stock reserved.'];
         } catch (Throwable $e) {
-            $this->conn->rollback();
+            if ($manageTransaction) $this->conn->rollback();
             return ['success' => false, 'message' => 'Insufficient confirmed ingredient stock: ' . $e->getMessage()];
         }
     }
-
     public function releaseOrderReservations(int $orderId, ?int $recordedBy = null): void
     {
         if (!$this->schemaReady()) return;
@@ -170,6 +172,46 @@ final class IngredientInventoryService
     }
 
     /** @return array<int,array<string,mixed>> */
+    /**
+     * Keeps the one-time legacy batch snapshot aligned when a chef edits the
+     * corresponding kitchen inventory master record. Receipt batches are never
+     * changed here: they remain the traceable source of truth for new stock.
+     *
+     * This method must run inside the caller's transaction.
+     */
+    public function synchronizeLegacyBatchFromInventory(int $restaurantId, int $inventoryId, string $quantity, string $unit, ?string $expirationDate, ?int $updatedBy = null): void
+    {
+        if (!self::isFeatureEnabled() || !$this->schemaReady()) return;
+
+        $scaled = RecipeAvailabilityCalculator::quantityToScaled($quantity);
+        $normalizedUnit = RecipeAvailabilityCalculator::normalizeUnit($unit);
+        if ($restaurantId <= 0 || $inventoryId <= 0 || $scaled === null || $scaled < 0 || $normalizedUnit === null) {
+            throw new RuntimeException('Inventory quantity or unit is invalid.');
+        }
+
+        $select = $this->conn->prepare("SELECT id, quantity_reserved FROM ingredient_inventory_batches WHERE restaurant_id=? AND inventory_id=? AND source_type='legacy_sync' ORDER BY id LIMIT 1 FOR UPDATE");
+        if (!$select) throw new RuntimeException('Unable to verify the legacy inventory batch.');
+        $select->bind_param('ii', $restaurantId, $inventoryId);
+        $select->execute();
+        $batch = $select->get_result()->fetch_assoc() ?: null;
+        $select->close();
+        if ($batch === null) return;
+
+        $reserved = RecipeAvailabilityCalculator::quantityToScaled((string)$batch['quantity_reserved']);
+        if ($reserved === null || $reserved < 0 || $scaled < $reserved) {
+            throw new RuntimeException('The updated stock cannot be lower than the quantity already reserved for customer orders.');
+        }
+
+        $quantityDecimal = RecipeAvailabilityCalculator::scaledToDecimal($scaled);
+        $status = $scaled > 0 ? 'active' : 'exhausted';
+        $update = $this->conn->prepare("UPDATE ingredient_inventory_batches SET quantity_received=GREATEST(quantity_received, ?), quantity_available=?, unit=?, expiration_date=?, batch_status=?, last_updated_by=?, updated_at=NOW() WHERE id=? AND restaurant_id=?");
+        if (!$update) throw new RuntimeException('Unable to synchronize the legacy inventory batch.');
+        $update->bind_param('sssssiii', $quantityDecimal, $quantityDecimal, $normalizedUnit, $expirationDate, $status, $updatedBy, $batch['id'], $restaurantId);
+        $ok = $update->execute();
+        $error = $update->error;
+        $update->close();
+        if (!$ok) throw new RuntimeException($error ?: 'Unable to synchronize the legacy inventory batch.');
+    }
     public function traceabilityFindings(int $restaurantId): array
     {
         return $this->schemaReady() ? IngredientEvidenceService::haceraFindings($this->conn, $restaurantId) : [];
@@ -178,26 +220,39 @@ final class IngredientInventoryService
     /** @return array<string,mixed>|null */
     private function activeRecipe(int $restaurantId, int $menuItemId): ?array
     {
-        $stmt = $this->conn->prepare("SELECT * FROM menu_recipes WHERE restaurant_id=? AND menu_item_id=? AND recipe_status='active' LIMIT 1");
-        $stmt->bind_param('ii', $restaurantId, $menuItemId); $stmt->execute(); $row = $stmt->get_result()->fetch_assoc() ?: null; $stmt->close(); return $row;
+        // A menu may have historical active rows from earlier migrations. The
+        // current (highest-id) recipe is the one used by the workflow UI.
+        $stmt = $this->conn->prepare("SELECT * FROM menu_recipes WHERE restaurant_id=? AND menu_item_id=? AND recipe_status='active' ORDER BY id DESC LIMIT 1");
+        $stmt->bind_param('ii', $restaurantId, $menuItemId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc() ?: null;
+        $stmt->close();
+        return $row;
     }
-
     /** @return array<int,array<string,mixed>> */
     private function recipeIngredients(int $recipeId): array
     {
-        $stmt = $this->conn->prepare('SELECT * FROM recipe_ingredients WHERE recipe_id=? ORDER BY id');
-        $stmt->bind_param('i', $recipeId); $stmt->execute(); $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC); $stmt->close(); return $rows;
+        // A rejected AI mapping is retained as audit history, not as an
+        // ingredient that should consume stock. Suggested and unmatched rows
+        // remain visible so they continue to block the recipe until resolved.
+        $stmt = $this->conn->prepare("SELECT * FROM recipe_ingredients WHERE recipe_id=? AND mapping_status<>'rejected' ORDER BY id");
+        $stmt->bind_param('i', $recipeId);
+        $stmt->execute();
+        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+        return $rows;
     }
-
     /** @return array<int,array<string,mixed>> */
     private function recipeIngredientsForMenu(int $restaurantId, int $menuId): array
     {
-        $stmt = $this->conn->prepare("SELECT ri.* FROM recipe_ingredients ri JOIN menu_recipes mr ON mr.id=ri.recipe_id WHERE mr.restaurant_id=? AND mr.menu_item_id=? AND mr.recipe_status='active' ORDER BY ri.id");
-        $stmt->bind_param('ii', $restaurantId, $menuId); $stmt->execute(); $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC); $stmt->close();
-        if ($rows === []) throw new RuntimeException('No active structured recipe is configured.');
+        // Reservations must use the exact same recipe selected for availability
+        // checks, never an aggregate of historical active recipe rows.
+        $recipe = $this->activeRecipe($restaurantId, $menuId);
+        if ($recipe === null) throw new RuntimeException('No active structured recipe is configured.');
+        $rows = $this->recipeIngredients((int)$recipe['id']);
+        if ($rows === []) throw new RuntimeException('The active recipe has no confirmed ingredients.');
         return $rows;
     }
-
     /** @return array<int,array<string,mixed>> */
     private function usableBatches(int $restaurantId, int $inventoryId): array
     {

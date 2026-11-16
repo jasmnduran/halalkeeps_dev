@@ -64,7 +64,7 @@ $params = [$rest_id];
 $types = 'i';
 
 // Filter by payment_status if provided (for awaiting_cash orders)
-if (!empty($payment_status_filter) && in_array($payment_status_filter, ['awaiting_cash', 'paid', 'pending'], true)) {
+if (!empty($payment_status_filter) && in_array($payment_status_filter, ['awaiting_cash', 'paid'], true)) {
     $query .= " AND o.payment_status = ?";
     $params[] = $payment_status_filter;
     $types .= 's';

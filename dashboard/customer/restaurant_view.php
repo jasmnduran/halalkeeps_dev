@@ -1,5 +1,7 @@
 <?php
 require_once __DIR__ . '/../../config/app.php';
+require_once __DIR__ . '/../../includes/MenuWorkflowService.php';
+require_once __DIR__ . '/../../includes/RevenuePaymentService.php';
 requireLogin();
 requireRole([ROLE_CUSTOMER]);
 
@@ -8,6 +10,12 @@ $page_heading = 'Restaurant Details';
 $is_dashboard = true;
 $user_id = $_SESSION['user_id'];
 $rid = intval($_GET['id'] ?? 0);
+$checkout_billing = (new RevenuePaymentService($conn))->billingSettings();
+$checkout_platform_fee = [
+    'enabled' => (bool)$checkout_billing['platform_fee_enabled'],
+    'rate' => (float)$checkout_billing['platform_fee_rate'],
+    'label' => (string)$checkout_billing['platform_fee_label'],
+];
 
 if (!$rid) {
     header('Location: ' . BASE_URL . 'dashboard/customer/restaurants.php');
@@ -91,9 +99,7 @@ $breadcrumbs  = [
 ];
 
 // ── Menu items (all items — unavailable shown with Sold Out badge) ────────────
-$menu = $conn->query(
-    "SELECT * FROM menu_items WHERE restaurant_id = $rid AND approval_status = 'approved' ORDER BY is_available DESC, category, name"
-)->fetch_all(MYSQLI_ASSOC);
+$menu = $conn->query("SELECT mi.* FROM menu_items mi WHERE mi.restaurant_id = $rid AND " . MenuWorkflowService::customerEligibilitySql('mi') . " ORDER BY mi.is_available DESC, mi.category, mi.name")->fetch_all(MYSQLI_ASSOC);
 
 // ── Ingredient transparency: load recipe ingredients for each menu item ───────
 $menu_ingredients = [];
@@ -1721,15 +1727,8 @@ function showCheckoutModal() {
             <div style="margin-bottom:16px;">
                 <label style="display:block;font-weight:700;margin-bottom:8px;font-size:0.9rem;">Payment Method</label>
                 <div style="display:flex;gap:10px;flex-wrap:wrap;">
-                    <label id="payment-cash-option" style="flex:1;min-width:45%;border:2px solid var(--primary-600);border-radius:10px;padding:10px;cursor:pointer;display:flex;align-items:center;gap:8px;background:var(--primary-50);">
-                        <input type="radio" name="payment_method_checkout" value="cash" checked onchange="updatePaymentInstructions()">
-                        <div style="display:flex;flex-direction:column;">
-                            <span style="font-weight:700;font-size:0.9rem;color:var(--primary-900);">💵 Cash</span>
-                            <span style="font-size:0.75rem;color:var(--neutral-600);margin-top:2px;">Pay at Cashier</span>
-                        </div>
-                    </label>
                     <label id="payment-gcash-option" style="flex:1;min-width:45%;border:2px solid var(--neutral-200);border-radius:10px;padding:10px;cursor:pointer;display:flex;align-items:center;gap:8px;">
-                        <input type="radio" name="payment_method_checkout" value="gcash" onchange="updatePaymentInstructions()">
+                        <input type="radio" name="payment_method_checkout" value="gcash" checked onchange="updatePaymentInstructions()">
                         <div style="display:flex;flex-direction:column;">
                             <span style="font-weight:700;font-size:0.9rem;">📱 GCash</span>
                             <span style="font-size:0.75rem;color:var(--neutral-600);margin-top:2px;">Pay Online</span>
@@ -1741,7 +1740,7 @@ function showCheckoutModal() {
                     <div style="display:flex;align-items:start;gap:8px;">
                         <i class="fas fa-info-circle" style="color:var(--warning-700);margin-top:2px;"></i>
                         <div style="font-size:0.82rem;color:var(--warning-900);">
-                            <strong>Cash Payment:</strong> After placing your order, please proceed to the cashier counter to complete payment of <strong id="cash-amount-display">₱` + subtotal.toFixed(2) + `</strong>. Your order will be confirmed once payment is received.
+                            <strong>Secure PayMongo payment:</strong> You will be redirected to PayMongo to pay <strong>₱` + subtotal.toFixed(2) + `</strong>. Your order is created only after PayMongo verifies payment.
                         </div>
                     </div>
                 </div>
@@ -1751,7 +1750,7 @@ function showCheckoutModal() {
         <div style="padding:16px 24px;border-top:2px solid var(--neutral-100);background:#fafafa;">
             <button onclick="submitOrder()" class="btn btn-primary" style="width:100%;padding:14px;font-size:1rem;font-weight:700;display:flex;align-items:center;justify-content:center;gap:8px;">
                 <i class="fas fa-check-circle"></i>
-                <span>Place Order</span>
+                <span>Continue to PayMongo</span>
             </button>
         </div>
     `;
@@ -1774,54 +1773,27 @@ function closeCheckoutModal() {
 }
 
 function updatePaymentInstructions() {
-    const paymentMethod = document.querySelector('input[name="payment_method_checkout"]:checked')?.value;
     const instructionsDiv = document.getElementById('payment-instructions');
-    const cashOption = document.getElementById('payment-cash-option');
     const gcashOption = document.getElementById('payment-gcash-option');
-    
-    // Update border and background for selected option
-    if (paymentMethod === 'cash') {
-        cashOption.style.borderColor = 'var(--primary-600)';
-        cashOption.style.background = 'var(--primary-50)';
-        gcashOption.style.borderColor = 'var(--neutral-200)';
-        gcashOption.style.background = 'transparent';
-    } else {
+    if (gcashOption) {
         gcashOption.style.borderColor = 'var(--primary-600)';
         gcashOption.style.background = 'var(--primary-50)';
-        cashOption.style.borderColor = 'var(--neutral-200)';
-        cashOption.style.background = 'transparent';
     }
-    
-    // Update instructions based on payment method
     const subtotal = cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
     const serviceType = document.querySelector('input[name="service_type_checkout"]:checked')?.value || 'dine-in';
     const deliveryFee = serviceType === 'delivery' ? 50 : 0;
     const totalAmount = subtotal + deliveryFee;
-    
-    if (paymentMethod === 'cash') {
-        instructionsDiv.style.display = 'block';
-        instructionsDiv.style.background = 'var(--warning-50)';
-        instructionsDiv.style.borderLeftColor = 'var(--warning-600)';
-        instructionsDiv.innerHTML = `
-            <div style="display:flex;align-items:start;gap:8px;">
-                <i class="fas fa-info-circle" style="color:var(--warning-700);margin-top:2px;"></i>
-                <div style="font-size:0.82rem;color:var(--warning-900);">
-                    <strong>Cash Payment:</strong> After placing your order, please proceed to the cashier counter to complete payment of <strong>₱${totalAmount.toFixed(2)}</strong>. Your order will be confirmed once payment is received.
-                </div>
-            </div>
-        `;
-    } else {
+    if (instructionsDiv) {
         instructionsDiv.style.display = 'block';
         instructionsDiv.style.background = 'var(--success-50)';
         instructionsDiv.style.borderLeftColor = 'var(--success-600)';
         instructionsDiv.innerHTML = `
             <div style="display:flex;align-items:start;gap:8px;">
-                <i class="fas fa-mobile-alt" style="color:var(--success-700);margin-top:2px;"></i>
+                <i class="fas fa-shield-alt" style="color:var(--success-700);margin-top:2px;"></i>
                 <div style="font-size:0.82rem;color:var(--success-900);">
-                    <strong>Online Payment:</strong> You will be redirected to PayMongo to complete your payment of <strong>₱${totalAmount.toFixed(2)}</strong> securely via GCash or other payment methods.
+                    <strong>Secure PayMongo payment:</strong> you will be redirected to PayMongo to pay <strong>₱${totalAmount.toFixed(2)}</strong>. The order is created only after PayMongo verifies payment.
                 </div>
-            </div>
-        `;
+            </div>`;
     }
 }
 
@@ -1905,7 +1877,7 @@ async function submitOrder() {
     if (!submitBtn) return;
     
     submitBtn.disabled = true;
-    submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Placing Order...';
+    submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Opening PayMongo...';
     
     try {
         const response = await fetch('<?= BASE_URL ?>dashboard/customer/api/place_order.php', {
@@ -2255,15 +2227,8 @@ function showCheckoutModal() {
             <div style="margin-bottom:16px;">
                 <label style="display:block;font-weight:700;margin-bottom:8px;font-size:0.9rem;">Payment Method</label>
                 <div style="display:flex;gap:10px;flex-wrap:wrap;">
-                    <label id="payment-cash-option" style="flex:1;min-width:45%;border:2px solid var(--primary-600);border-radius:10px;padding:10px;cursor:pointer;display:flex;align-items:center;gap:8px;background:var(--primary-50);">
-                        <input type="radio" name="payment_method_checkout" value="cash" checked onchange="updatePaymentInstructions()">
-                        <div style="display:flex;flex-direction:column;">
-                            <span style="font-weight:700;font-size:0.9rem;color:var(--primary-900);">💵 Cash</span>
-                            <span style="font-size:0.75rem;color:var(--neutral-600);margin-top:2px;">Pay at Cashier</span>
-                        </div>
-                    </label>
                     <label id="payment-gcash-option" style="flex:1;min-width:45%;border:2px solid var(--neutral-200);border-radius:10px;padding:10px;cursor:pointer;display:flex;align-items:center;gap:8px;">
-                        <input type="radio" name="payment_method_checkout" value="gcash" onchange="updatePaymentInstructions()">
+                        <input type="radio" name="payment_method_checkout" value="gcash" checked onchange="updatePaymentInstructions()">
                         <div style="display:flex;flex-direction:column;">
                             <span style="font-weight:700;font-size:0.9rem;">📱 GCash</span>
                             <span style="font-size:0.75rem;color:var(--neutral-600);margin-top:2px;">Pay Online</span>
@@ -2275,7 +2240,7 @@ function showCheckoutModal() {
                     <div style="display:flex;align-items:start;gap:8px;">
                         <i class="fas fa-info-circle" style="color:var(--warning-700);margin-top:2px;"></i>
                         <div style="font-size:0.82rem;color:var(--warning-900);">
-                            <strong>Cash Payment:</strong> After placing your order, please proceed to the cashier counter to complete payment of <strong id="cash-amount-display">₱` + subtotal.toFixed(2) + `</strong>. Your order will be confirmed once payment is received.
+                            <strong>Secure PayMongo payment:</strong> You will be redirected to PayMongo to pay <strong>₱` + subtotal.toFixed(2) + `</strong>. Your order is created only after PayMongo verifies payment.
                         </div>
                     </div>
                 </div>
@@ -2285,7 +2250,7 @@ function showCheckoutModal() {
         <div style="padding:16px 24px;border-top:2px solid var(--neutral-100);background:#fafafa;">
             <button onclick="submitOrder()" class="btn btn-primary" style="width:100%;padding:14px;font-size:1rem;font-weight:700;display:flex;align-items:center;justify-content:center;gap:8px;">
                 <i class="fas fa-check-circle"></i>
-                <span>Place Order</span>
+                <span>Continue to PayMongo</span>
             </button>
         </div>
     `;
@@ -2308,54 +2273,27 @@ function closeCheckoutModal() {
 }
 
 function updatePaymentInstructions() {
-    const paymentMethod = document.querySelector('input[name="payment_method_checkout"]:checked')?.value;
     const instructionsDiv = document.getElementById('payment-instructions');
-    const cashOption = document.getElementById('payment-cash-option');
     const gcashOption = document.getElementById('payment-gcash-option');
-    
-    // Update border and background for selected option
-    if (paymentMethod === 'cash') {
-        cashOption.style.borderColor = 'var(--primary-600)';
-        cashOption.style.background = 'var(--primary-50)';
-        gcashOption.style.borderColor = 'var(--neutral-200)';
-        gcashOption.style.background = 'transparent';
-    } else {
+    if (gcashOption) {
         gcashOption.style.borderColor = 'var(--primary-600)';
         gcashOption.style.background = 'var(--primary-50)';
-        cashOption.style.borderColor = 'var(--neutral-200)';
-        cashOption.style.background = 'transparent';
     }
-    
-    // Update instructions based on payment method
     const subtotal = cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
     const serviceType = document.querySelector('input[name="service_type_checkout"]:checked')?.value || 'dine-in';
     const deliveryFee = serviceType === 'delivery' ? 50 : 0;
     const totalAmount = subtotal + deliveryFee;
-    
-    if (paymentMethod === 'cash') {
-        instructionsDiv.style.display = 'block';
-        instructionsDiv.style.background = 'var(--warning-50)';
-        instructionsDiv.style.borderLeftColor = 'var(--warning-600)';
-        instructionsDiv.innerHTML = `
-            <div style="display:flex;align-items:start;gap:8px;">
-                <i class="fas fa-info-circle" style="color:var(--warning-700);margin-top:2px;"></i>
-                <div style="font-size:0.82rem;color:var(--warning-900);">
-                    <strong>Cash Payment:</strong> After placing your order, please proceed to the cashier counter to complete payment of <strong>₱${totalAmount.toFixed(2)}</strong>. Your order will be confirmed once payment is received.
-                </div>
-            </div>
-        `;
-    } else {
+    if (instructionsDiv) {
         instructionsDiv.style.display = 'block';
         instructionsDiv.style.background = 'var(--success-50)';
         instructionsDiv.style.borderLeftColor = 'var(--success-600)';
         instructionsDiv.innerHTML = `
             <div style="display:flex;align-items:start;gap:8px;">
-                <i class="fas fa-mobile-alt" style="color:var(--success-700);margin-top:2px;"></i>
+                <i class="fas fa-shield-alt" style="color:var(--success-700);margin-top:2px;"></i>
                 <div style="font-size:0.82rem;color:var(--success-900);">
-                    <strong>Online Payment:</strong> You will be redirected to PayMongo to complete your payment of <strong>₱${totalAmount.toFixed(2)}</strong> securely via GCash or other payment methods.
+                    <strong>Secure PayMongo payment:</strong> you will be redirected to PayMongo to pay <strong>₱${totalAmount.toFixed(2)}</strong>. The order is created only after PayMongo verifies payment.
                 </div>
-            </div>
-        `;
+            </div>`;
     }
 }
 
@@ -2439,7 +2377,7 @@ async function submitOrder() {
     if (!submitBtn) return;
     
     submitBtn.disabled = true;
-    submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Placing Order...';
+    submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Opening PayMongo...';
     
     try {
         const response = await fetch('<?= BASE_URL ?>dashboard/customer/api/place_order.php', {
@@ -2516,5 +2454,41 @@ function showCartToast(msg, isErr) {
 document.addEventListener('DOMContentLoaded', function () {
     if (typeof openStaffModal === 'function') openStaffModal();
 });
+
+// Display only: the order API recomputes this same fee server-side before checkout.
+const CHECKOUT_PLATFORM_FEE = <?= json_encode($checkout_platform_fee, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>;
+const checkoutPeso = String.fromCharCode(0x20B1);
+function refreshCheckoutPlatformFee() {
+    const modal = document.getElementById('checkout-modal-overlay');
+    if (!modal) return;
+    const totalEl = document.getElementById('checkout-total');
+    if (!totalEl) return;
+    const serviceType = document.querySelector('input[name="service_type_checkout"]:checked')?.value || 'dine-in';
+    const paymentMethod = document.querySelector('input[name="payment_method_checkout"]:checked')?.value || 'gcash';
+    const subtotal = cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+    const deliveryFee = serviceType === 'delivery' ? 50 : 0;
+    const eligible = ['gcash', 'bank_transfer', 'paymongo', 'card'].includes(paymentMethod);
+    const fee = CHECKOUT_PLATFORM_FEE.enabled && eligible ? Number(((subtotal + deliveryFee) * Number(CHECKOUT_PLATFORM_FEE.rate)).toFixed(2)) : 0;
+    let feeRow = document.getElementById('platform-fee-row');
+    if (!feeRow) {
+        feeRow = document.createElement('div');
+        feeRow.id = 'platform-fee-row';
+        feeRow.style.cssText = 'display:none;justify-content:space-between;margin-bottom:6px;';
+        totalEl.parentElement.parentElement.insertBefore(feeRow, totalEl.parentElement);
+    }
+    feeRow.style.display = fee > 0 ? 'flex' : 'none';
+    if (fee > 0) feeRow.innerHTML = '<span style="font-size:.85rem;color:var(--neutral-600);">' + escapeHtml(CHECKOUT_PLATFORM_FEE.label) + ' (' + (Number(CHECKOUT_PLATFORM_FEE.rate) * 100).toFixed(2) + '%)</span><span style="font-weight:600;">' + checkoutPeso + fee.toFixed(2) + '</span>';
+    totalEl.textContent = checkoutPeso + (subtotal + deliveryFee + fee).toFixed(2);
+    const instructions = document.getElementById('payment-instructions');
+    if (instructions && paymentMethod !== 'cash' && fee > 0) {
+        instructions.innerHTML = '<div style="display:flex;align-items:start;gap:8px;"><i class="fas fa-mobile-alt" style="color:var(--success-700);margin-top:2px;"></i><div style="font-size:0.82rem;color:var(--success-900);"><strong>Online Payment:</strong> You will be redirected to PayMongo to complete your payment of <strong>' + checkoutPeso + (subtotal + deliveryFee + fee).toFixed(2) + '</strong>. This includes the ' + escapeHtml(CHECKOUT_PLATFORM_FEE.label) + ' of ' + checkoutPeso + fee.toFixed(2) + '.</div></div>';
+    }
+}
+const baseShowCheckoutModal = showCheckoutModal;
+showCheckoutModal = function () { baseShowCheckoutModal(); refreshCheckoutPlatformFee(); };
+const baseUpdatePaymentInstructions = updatePaymentInstructions;
+updatePaymentInstructions = function () { baseUpdatePaymentInstructions(); refreshCheckoutPlatformFee(); };
+const baseUpdateServiceType = updateServiceType;
+updateServiceType = function (type) { baseUpdateServiceType(type); baseUpdatePaymentInstructions(); refreshCheckoutPlatformFee(); };
 </script>
 <?php endif; ?>

@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS `hacera_ai_runs` (
     `requested_by` INT(11) NOT NULL,
     `status` VARCHAR(20) NOT NULL DEFAULT 'queued',
     `input_hash` CHAR(64) NOT NULL,
+    `assessment_version_hash` CHAR(64) DEFAULT NULL COMMENT 'Paid HaCeRa assessment version; legacy rows stay locked',
     `provider` VARCHAR(50) NOT NULL DEFAULT 'openai_compatible',
     `model` VARCHAR(120) NOT NULL DEFAULT '',
     `prompt_version` VARCHAR(60) NOT NULL,
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS `hacera_ai_runs` (
     KEY `idx_hacera_ai_runs_restaurant` (`restaurant_id`, `requested_at`),
     KEY `idx_hacera_ai_runs_queue` (`status`, `requested_at`),
     KEY `idx_hacera_ai_runs_hash` (`restaurant_id`, `input_hash`),
+    KEY `idx_hacera_ai_runs_version` (`restaurant_id`, `assessment_version_hash`),
     CONSTRAINT `fk_hacera_ai_runs_restaurant`
         FOREIGN KEY (`restaurant_id`) REFERENCES `halal_restaurants` (`id`) ON DELETE CASCADE,
     CONSTRAINT `fk_hacera_ai_runs_user`

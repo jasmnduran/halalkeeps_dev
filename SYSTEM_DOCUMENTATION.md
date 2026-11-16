@@ -115,7 +115,7 @@ These are stored in `restaurant_staff_roles` and assigned via `restaurant_staff`
 | `owner` | Business Owner | `owner_dashboard.php` | Full access to all restaurant features |
 | `ops_manager` | Operations Manager | `operations_manager.php` | Menu, reviews, grocery lists, expenses, halal cert |
 | `cashier` | Cashier | `pos_order_processing.php` | POS orders, payment confirmation |
-| `chef` | Chef / Head Cook | `chef_dashboard.php` | Kitchen inventory, recipes, suppliers, POS guardrails |
+| `chef` | Chef / Head Cook | `chef_dashboard.php` | Creates menu drafts, manages recipes and inventory, submits menus for review, and can remove menus from live ordering |
 
 ### Role Capabilities Summary
 
@@ -465,12 +465,26 @@ Once certified, a Business Owner manages their restaurant through a multi-role s
 
 ### Menu Management
 
-- **Table:** `menu_items`
-- Menu item approval workflow:
-  1. Owner/Ops Manager adds item → `approval_status = 'pending'`
-  2. Admin reviews → `approved` | `rejected`
-  3. Chef can set `operational_status` (available/unavailable based on inventory)
-  4. `customer_visibility_status` on recipes: `draft` | `published` | `needs_reapproval`
+The menu workflow is handled by `MenuWorkflowService.php` and the menu workflow APIs. New rows keep the existing `approval_status` column for compatibility, while `workflow_status` provides the Chef-to-Operations state machine.
+
+1. Chef (or owner) creates a menu item as a `draft` through `add_menu_item.php`.
+2. Chef creates a structured recipe and confirms every ingredient-to-inventory mapping.
+3. Chef submits the completed item through `menu_workflow_api.php`; its state becomes `pending_review` and the Operations Manager is notified.
+4. The Operations Manager (or owner) uses `menu_item_approval.php` to `approve`, return it as `needs_revision`, or `reject` it.
+5. Approval sets `workflow_status = approved`, publishes the active recipe disclosure, and makes the item eligible for customer/POS ordering when inventory and Halal evidence checks also pass.
+6. Editing an approved menu unpublishes its recipe and returns it to draft/reapproval before it can appear again.
+
+Workflow states are `legacy`, `draft`, `pending_review`, `needs_revision`, `approved`, `rejected`, and `deleted`. Legacy approved items remain supported for existing data.
+
+#### Menu deletion
+
+- Draft, returned, and rejected menus can be permanently deleted by the Chef from `chef_dashboard.php?tab=menu_submit`; their draft recipe and mappings are removed with the menu.
+- A delete control is also displayed for an approved/live menu. The browser requires an explicit confirmation that it will be removed from customer and POS ordering.
+- Confirming deletion of a live menu archives it rather than removing historic data: `workflow_status` becomes `deleted`, `approval_status` becomes `rejected`, `is_available` becomes `0`, and active recipe disclosure is reset to `draft`. It therefore disappears immediately from customer and POS queries while order and approval history are retained.
+- Menus in `pending_review` cannot be deleted. Delete requests are CSRF-protected and scoped to the current restaurant; owners may override the Chef ownership check.
+
+Customer and POS reads use `MenuWorkflowService::customerEligibilitySql()`. A menu must be approved and either be legacy or have an active recipe whose customer visibility is `published`; POS/order APIs additionally require `is_available = 1`.
+
 - Categories: Appetizer, Main Course, Rice, Noodles, House Specialty, Desserts, Soups, etc.
 - Serving types: Per serving / For sharing
 
@@ -714,7 +728,9 @@ VIEW tpb_item_averages    -- Per-item Likert averages broken down by religion
 
 ## 10. Payment Processing
 
-### PayMongo Integration (Online Payments)
+### Legacy PayMongo Integration (Historical)
+
+Historical context only: the centralized current flow in the next section supersedes the older v1 order-checkout description below.
 
 Used for:
 - Customer online food orders (GCash, card, PayMaya)
@@ -741,6 +757,56 @@ api/process_paymongo_payment.php
      └─ Success redirect → customer order tracking page
 ```
 
+### Verified Revenue, Reports & Order Checkout (Current)
+
+The four chargeable models are centralized in `includes/RevenuePaymentService.php`. It is the only new code path that creates PayMongo Hosted Checkout sessions, and it keeps the PayMongo secret key on the server.
+
+| Product | Price / entitlement | Who can start it |
+|---|---:|---|
+| HaCeRa Inspection Readiness Portfolio | ₱150; saved assessment snapshot PDF | Restaurant owner |
+| P&L export | ₱150; saved date-range management P&L PDF | Owner or active Operations Manager |
+| Inventory expansion pack | ₱199; +50 logical `kitchen_inventory` records for 90 days | Owner or active Operations Manager |
+| Customer / POS online order | Actual server-calculated order total; optional approved platform fee | Customer or active cashier/owner respectively |
+
+Prices, included slots, validity, and the disabled-by-default fee policy live in `system_settings` under `billing_*` keys and are managed through `admin/billing_settings.php`. `billing_platform_fee_enabled` starts at `0`. When enabled, `billing_platform_fee_rate` is accepted only from 1.14% through 1.20%; anything outside that range resolves to zero. The fee is stored in `orders.platform_fee`, excluded from restaurant P&L/revenue, and recorded separately in `halal_keeps_revenue_ledger`.
+
+**Authoritative checkout flow**
+
+```text
+Browser submits item IDs + quantities / report period / storage choice
+  -> RevenuePaymentService derives server-side price, amount, and entitlement
+  -> POST /v2/checkout_sessions with a unique internal reference
+  -> browser redirect is informational only
+  -> PayMongo POSTs checkout_session.payment.paid
+  -> api/paymongo_webhook.php verifies Paymongo-Signature:
+       timestamp + raw body HMAC-SHA256, test/live signature key, 5-minute window
+  -> unique provider event ID + row lock make fulfillment idempotent
+  -> exact PHP centavo amount and currency are compared to the pending request
+  -> mark order paid and issue its receipt / activate report or pack / create ledger entry
+```
+
+No report, storage entitlement, or online order is unlocked by a success URL. Refund webhooks mark the request and ledger refunded; report delivery and unexpired storage entitlements are revoked. Existing `payments` rows are still written for order history compatibility, while `billing_payment_requests` is the authoritative new fulfillment record.
+
+**Migration and tables**
+
+Apply `database_migrations/add_paymongo_revenue_models.sql`. It adds order fee/receipt/session fields and creates:
+
+- `billing_payment_requests` — internal reference, expected amount/currency, provider session/payment IDs, lifecycle, idempotency key.
+- `paymongo_webhook_events` — signature-validated raw event audit with unique provider event ID.
+- `hacera_report_purchases` and `pnl_export_purchases` — paid snapshot entitlements.
+- `inventory_storage_packs` — paid, activated, and expired capacity history.
+- `halal_keeps_revenue_ledger` — platform revenue, restaurant amount, processor fee, and refund state.
+
+The owner and Operations Manager use `dashboard/business_owner/billing.php`; Chef inventory displays capacity but cannot purchase. `dashboard/business_owner/api/chef_action.php` blocks new logical ingredient records at the active capacity. The existing certification/laboratory payment interface remains on its legacy path.
+
+**Relevant endpoints**
+
+- `dashboard/business_owner/api/revenue_payment_api.php` — CSRF-protected report and storage checkout requests.
+- `dashboard/business_owner/api/revenue_report_download.php` — verified P&L snapshot PDF.
+- `dashboard/business_owner/api/hacera_api.php?action=generate_pdf&purchase_id=...` — verified HaCeRa snapshot PDF.
+- `api/paymongo_webhook.php` — signed, idempotent webhook receiver.
+- `dashboard/customer/api/place_order.php` and `dashboard/business_owner/pos_order_processing.php` — reload live menu prices and use the central checkout service.
+- Customer/POS payment-return handlers are informational only; `dashboard/customer/order_receipt.php` renders a customer-authorized printable receipt only after verified order payment.
 ### Cash Payments (POS)
 
 ```
@@ -787,6 +853,9 @@ Chef adds inventory batch → ingredient_inventory_batches
          POS blocks ordering of unavailable items ("POS Guardrails")
 ```
 
+### Menu approval and publication
+
+A completed recipe is required before Operations review. `RecipeAvailabilityCalculator` checks the confirmed ingredient mappings, stock, and evidence; these checks determine operational orderability but do not replace the Operations approval decision. Customer and POS surfaces only receive an approved menu whose active recipe is published. A later recipe or menu edit changes the recipe visibility to `needs_reapproval` or `draft`, preventing stale recipe data from remaining public.
 ### Ingredient Evidence
 
 - Suppliers linked to ingredient batches
@@ -922,9 +991,11 @@ Triggered via `api/credibility_scores.php` (Admin/President access).
 |---|---|
 | `dashboard/business_owner/api/hacera_ai_api.php` | Run HaCeRa AI analysis |
 | `dashboard/business_owner/api/hacera_api.php` | Save HaCeRa self-assessment responses |
-| `dashboard/business_owner/api/ingredient_menu_api.php` | Ingredient-to-menu AI mapping |
-| `dashboard/business_owner/api/update_menu_item.php` | Update menu item details |
-| `dashboard/business_owner/api/menu_item_approval.php` | Admin approve/reject menu items |
+| `dashboard/business_owner/api/add_menu_item.php` | Create a Chef/owner menu draft |
+| `dashboard/business_owner/api/ingredient_menu_api.php` | Create recipes and manage ingredient-to-inventory mappings |
+| `dashboard/business_owner/api/menu_workflow_api.php` | Submit a complete menu for review or delete/archive a menu |
+| `dashboard/business_owner/api/update_menu_item.php` | Update a draft or return a changed approved menu to reapproval |
+| `dashboard/business_owner/api/menu_item_approval.php` | Operations Manager/owner approve, return, or reject submitted menus |
 | `dashboard/business_owner/api/chef_action.php` | Chef kitchen management actions |
 | `dashboard/business_owner/api/staff_action.php` | Staff activation/deactivation |
 | `dashboard/business_owner/api/staff_role_handler.php` | Manage staff role definitions |
@@ -1290,10 +1361,26 @@ Triggered via `api/credibility_scores.php` (Admin/President access).
 | category | VARCHAR(100) | |
 | image_path | VARCHAR(500) | |
 | is_available | TINYINT(1) | Manual on/off toggle |
-| approval_status | ENUM | `pending`, `approved`, `rejected` |
+| approval_status | ENUM | Compatibility status: `pending`, `approved`, `rejected` |
+| workflow_status | VARCHAR(30) | `legacy`, `draft`, `pending_review`, `needs_revision`, `approved`, `rejected`, or `deleted` |
+| workflow_updated_at | DATETIME | Last workflow state transition |
+| submitted_by / reviewed_by | INT FK -> users.id | Chef/owner submitter and Operations reviewer |
 | operational_status | ENUM | Auto-computed from inventory |
 | ingredient_evidence_status | VARCHAR | Halal evidence status |
 | serving_type | VARCHAR | `Per serving` / `For sharing` |
+
+#### `menu_item_approval_history`
+| Column | Type | Notes |
+|---|---|---|
+| id | BIGINT PK | |
+| restaurant_id / menu_item_id | INT FK | Restaurant and menu item (`menu_item_id` cascades on hard delete) |
+| recipe_id / recipe_version_no | BIGINT / INT | Reviewed recipe snapshot; recipe reference is set to NULL if removed |
+| submitted_by / reviewed_by | INT FK | Workflow actors |
+| decision | ENUM | `submitted`, `resubmitted`, `approved`, `needs_revision`, `rejected` |
+| remarks | VARCHAR(1000) | Operations review feedback |
+| submitted_at / reviewed_at / created_at | DATETIME | Audit timeline |
+
+The additive migration is `database_migrations/add_menu_recipe_approval_workflow.sql`.
 
 #### `orders`
 | Column | Type | Notes |
@@ -1670,6 +1757,8 @@ halal_certificates → halal_restaurants
 
 users → halal_restaurants (ON DELETE CASCADE)
 halal_restaurants → menu_items (ON DELETE CASCADE)
+menu_items → menu_item_approval_history (ON DELETE CASCADE)
+menu_recipes → menu_item_approval_history.recipe_id (ON DELETE SET NULL)
 users → orders (ON DELETE CASCADE)
 halal_restaurants → orders (ON DELETE CASCADE)
 orders → reviews (ON DELETE SET NULL)
@@ -1870,6 +1959,7 @@ GOOGLE_CLIENT_SECRET=...
 # PayMongo
 PAYMONGO_SECRET_KEY=sk_test_...
 PAYMONGO_PUBLIC_KEY=pk_test_...
+PAYMONGO_WEBHOOK_SECRET=whsec_...   # required; webhook verification fails closed without it
 
 # Security
 FIELD_ENCRYPT_KEY=your-256-bit-key

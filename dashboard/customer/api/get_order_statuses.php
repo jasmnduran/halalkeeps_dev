@@ -57,6 +57,9 @@ $query = "
     FROM orders
     WHERE id IN ($placeholders)
       AND customer_id = ?
+      AND payment_status = 'paid'
+      AND payment_verified_at IS NOT NULL
+      AND EXISTS (SELECT 1 FROM billing_payment_requests b WHERE b.order_id = orders.id AND b.provider = 'paymongo' AND b.service_type = 'order' AND b.status = 'paid')
 ";
 
 $stmt = $conn->prepare($query);

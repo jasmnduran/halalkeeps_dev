@@ -1,215 +1,61 @@
 <?php
-/**
- * AJAX endpoint: add a single menu item.
- * Access: business_owner (direct or via staff role: owner, ops_manager, chef)
- *
- * Approval workflow:
- *   - Chef submissions   → approval_status = 'pending'  (requires ops/owner review)
- *   - Owner submissions  → approval_status = 'approved' (owner bypass — direct publish)
- *   - Ops Mgr            → approval_status = 'pending'  (consistent with chef flow)
- *
- * Returns JSON: { success, message, item? }
- */
+/** Create a menu draft. A recipe and Chef-confirmed mappings are required before submission. */
+declare(strict_types=1);
 require_once __DIR__ . '/../../../config/app.php';
+require_once __DIR__ . '/../../../includes/MenuWorkflowService.php';
 
 header('Content-Type: application/json; charset=utf-8');
-
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    http_response_code(405);
-    echo json_encode(['success' => false, 'message' => 'Method not allowed.']);
-    exit;
-}
-if (!isLoggedIn()) {
-    http_response_code(401);
-    echo json_encode(['success' => false, 'message' => 'Not authenticated.']);
-    exit;
-}
-if ((int)($_SESSION['role_id'] ?? 0) !== ROLE_BUSINESS_OWNER) {
-    http_response_code(403);
-    echo json_encode(['success' => false, 'message' => 'Access denied.']);
+function menu_draft_json(bool $success, string $message, array $extra = [], int $statusCode = 200): never {
+    http_response_code($statusCode);
+    echo json_encode(['success' => $success, 'message' => $message] + $extra);
     exit;
 }
 
-$user_id   = (int)$_SESSION['user_id'];
-$staff_key = $_SESSION['staff_role_key'] ?? null;
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') menu_draft_json(false, 'Method not allowed.', [], 405);
+if (!isLoggedIn() || (int)($_SESSION['role_id'] ?? 0) !== ROLE_BUSINESS_OWNER) menu_draft_json(false, 'Access denied.', [], 403);
+if (!MenuWorkflowService::validCsrfToken($_POST['csrf_token'] ?? null)) menu_draft_json(false, 'Your session token is invalid. Refresh the page and try again.', [], 419);
 
-// ── Resolve restaurant ────────────────────────────────────────────────────────
-if ($staff_key === STAFF_ROLE_CHEF) {
-    $sk = STAFF_ROLE_CHEF;
-    $rs = $conn->prepare("
-        SELECT hr.id, hr.business_owner_id
-        FROM restaurant_staff rs
-        JOIN restaurant_staff_roles rsr ON rs.staff_role_id = rsr.id
-        JOIN halal_restaurants hr        ON rs.restaurant_id  = hr.id
-        WHERE rs.user_id = ? AND rsr.role_key = ? AND rs.is_active = 1
-        LIMIT 1
-    ");
-    $rs->bind_param("is", $user_id, $sk);
-    $rs->execute();
-    $restaurant = $rs->get_result()->fetch_assoc();
-    $rs->close();
-} elseif ($staff_key === STAFF_ROLE_OPS_MANAGER) {
-    $sk = STAFF_ROLE_OPS_MANAGER;
-    $rs = $conn->prepare("
-        SELECT hr.id, hr.business_owner_id
-        FROM restaurant_staff rs
-        JOIN restaurant_staff_roles rsr ON rs.staff_role_id = rsr.id
-        JOIN halal_restaurants hr        ON rs.restaurant_id  = hr.id
-        WHERE rs.user_id = ? AND rsr.role_key = ? AND rs.is_active = 1
-        LIMIT 1
-    ");
-    $rs->bind_param("is", $user_id, $sk);
-    $rs->execute();
-    $restaurant = $rs->get_result()->fetch_assoc();
-    $rs->close();
-} else {
-    // Direct business owner (no staff sub-role)
-    $rs = $conn->prepare("SELECT id, business_owner_id FROM halal_restaurants WHERE business_owner_id = ? LIMIT 1");
-    $rs->bind_param("i", $user_id);
-    $rs->execute();
-    $restaurant = $rs->get_result()->fetch_assoc();
-    $rs->close();
+$userId = (int)($_SESSION['user_id'] ?? 0);
+$staffKey = $_SESSION['staff_role_key'] ?? null;
+if (!in_array($staffKey, [null, STAFF_ROLE_CHEF], true)) menu_draft_json(false, 'Only the Chef or Business Owner can create menu drafts.', [], 403);
+$restaurantId = getSessionRestaurantId($conn);
+if ($restaurantId <= 0) menu_draft_json(false, 'No active restaurant was found.', [], 422);
+$workflow = new MenuWorkflowService($conn);
+if (!$workflow->schemaReady()) menu_draft_json(false, 'The menu workflow migration has not been applied yet.', [], 503);
+
+$name = trim(sanitize($_POST['dish_name'] ?? ''));
+$category = trim(sanitize($_POST['dish_cat'] ?? ''));
+$priceRaw = trim((string)($_POST['dish_price'] ?? ''));
+$description = sanitize($_POST['dish_desc'] ?? '');
+$servingType = sanitize($_POST['dish_serving_type'] ?? 'Per serving');
+if ($name === '') menu_draft_json(false, 'Menu name is required.');
+if ($category === '' || !in_array($category, MENU_ITEM_CATEGORIES, true)) menu_draft_json(false, 'Select a valid menu category.');
+if ($priceRaw === '' || !is_numeric($priceRaw) || (float)$priceRaw < 0) menu_draft_json(false, 'A valid menu price is required.');
+if (!in_array($servingType, ALLOWED_SERVING_TYPES, true)) $servingType = 'Per serving';
+$price = round((float)$priceRaw, 2);
+
+$imagePath = '';
+if (!empty($_FILES['dish_image']['name']) && ($_FILES['dish_image']['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+    $upload = uploadFile($_FILES['dish_image'], 'menu_images', ['jpg', 'jpeg', 'png', 'gif', 'webp']);
+    if (!$upload['success']) menu_draft_json(false, 'Menu image could not be uploaded.');
+    $imagePath = (string)$upload['path'];
 }
 
-if (!$restaurant) {
-    http_response_code(422);
-    echo json_encode(['success' => false, 'message' => 'No restaurant found for your account.']);
-    exit;
-}
+$stmt = $conn->prepare("INSERT INTO menu_items (restaurant_id,name,description,price,category,image_path,serving_type,is_available,approval_status,workflow_status,workflow_updated_at,submitted_by) VALUES (?,?,?,?,?,?,?,1,'pending','draft',NOW(),?)");
+if (!$stmt) menu_draft_json(false, 'Could not prepare menu draft.', [], 500);
+$stmt->bind_param('issdsssi', $restaurantId, $name, $description, $price, $category, $imagePath, $servingType, $userId);
+if (!$stmt->execute()) { $error = $stmt->error; $stmt->close(); menu_draft_json(false, 'Could not save menu draft.', [], 500); }
+$menuId = (int)$conn->insert_id;
+$stmt->close();
 
-$restaurant_id    = (int)$restaurant['id'];
-$restaurant_owner = (int)$restaurant['business_owner_id'];
-
-// ── Approval status: owners publish directly; all others go to pending ────────
-$is_direct_owner = ($staff_key === null && $user_id === $restaurant_owner);
-$approval_status = $is_direct_owner ? 'approved' : 'pending';
-
-// ── Idempotent schema migration ───────────────────────────────────────────────
-db_add_column($conn, 'menu_items', 'approval_status',
-    "ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending'");
-db_add_column($conn, 'menu_items', 'submitted_by',     'INT UNSIGNED NULL');
-db_add_column($conn, 'menu_items', 'reviewed_by',      'INT UNSIGNED NULL');
-db_add_column($conn, 'menu_items', 'reviewed_at',      'DATETIME NULL');
-db_add_column($conn, 'menu_items', 'rejection_reason', 'VARCHAR(255) NULL');
-
-// ── Validate & sanitize inputs ────────────────────────────────────────────────
-$allowed_serving_types = ALLOWED_SERVING_TYPES;
-$allowed_categories    = MENU_ITEM_CATEGORIES;
-
-$dish_name = trim(sanitize($_POST['dish_name'] ?? ''));
-if ($dish_name === '') {
-    echo json_encode(['success' => false, 'message' => 'Dish name is required.']);
-    exit;
-}
-
-$dish_price   = max(0, floatval($_POST['dish_price']   ?? 0));
-$dish_cat     = sanitize($_POST['dish_cat']            ?? '') ?: 'Main Course';
-if (!in_array($dish_cat, $allowed_categories, true)) $dish_cat = 'Main Course';
-
-$dish_desc    = sanitize($_POST['dish_desc']           ?? '');
-$dish_serving = sanitize($_POST['dish_serving_type']   ?? 'Per serving');
-if (!in_array($dish_serving, $allowed_serving_types, true)) $dish_serving = 'Per serving';
-
-// ── Optional image upload ─────────────────────────────────────────────────────
-$img_path = '';
-if (!empty($_FILES['dish_image']['name']) && $_FILES['dish_image']['error'] === UPLOAD_ERR_OK) {
-    $up = uploadFile($_FILES['dish_image'], 'menu_images', ['jpg','jpeg','png','gif','webp']);
-    if ($up['success']) {
-        $img_path = $up['path'];
-    } else {
-        error_log('Menu image upload failed: ' . ($up['message'] ?? 'unknown error'));
-    }
-}
-
-// ── Insert with approval status ───────────────────────────────────────────────
-$ins = $conn->prepare(
-    "INSERT INTO menu_items
-        (restaurant_id, name, description, price, category, image_path,
-         serving_type, approval_status, submitted_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-);
-if (!$ins) {
-    http_response_code(500);
-    echo json_encode(['success' => false, 'message' => 'Database error: ' . $conn->error]);
-    exit;
-}
-
-$ins->bind_param("issdssssi",
-    $restaurant_id,
-    $dish_name,
-    $dish_desc,
-    $dish_price,
-    $dish_cat,
-    $img_path,
-    $dish_serving,
-    $approval_status,
-    $user_id
-);
-
-if (!$ins->execute()) {
-    http_response_code(500);
-    echo json_encode(['success' => false, 'message' => 'Failed to save item: ' . $ins->error]);
-    exit;
-}
-$new_id = (int)$conn->insert_id;
-
-// ── Notifications ─────────────────────────────────────────────────────────────
-if ($approval_status === 'pending') {
-    // Notify ops_manager(s) and owner to review the submission
-    $notify_targets = [];
-
-    // Always notify the restaurant owner
-    $notify_targets[] = $restaurant_owner;
-
-    // Also notify any active ops_manager(s) for this restaurant
-    $ops_q = $conn->query("
-        SELECT rs.user_id
-        FROM   restaurant_staff rs
-        JOIN   restaurant_staff_roles rsr ON rs.staff_role_id = rsr.id
-        WHERE  rs.restaurant_id = {$restaurant_id}
-          AND  rsr.role_key     = 'ops_manager'
-          AND  rs.is_active     = 1
-    ");
-    if ($ops_q) {
-        while ($op = $ops_q->fetch_assoc()) {
-            $notify_targets[] = (int)$op['user_id'];
-        }
-    }
-
-    foreach (array_unique($notify_targets) as $tid) {
-        if ($tid === $user_id) continue; // don't notify yourself
-        createNotification(
-            $conn, $tid,
-            'Menu Item Pending Approval',
-            '"' . $dish_name . '" was submitted for approval and needs your review.',
-            'action_required',
-            BASE_URL . 'dashboard/business_owner/operations_manager.php?tab=menu'
-        );
-    }
-} else {
-    // Owner published directly — log only
-    if (function_exists('logActivity')) {
-        logActivity($conn, $user_id, 'Menu Item Published',
-            "Owner directly published \"{$dish_name}\" (id={$new_id})", 'menu');
-    }
-}
-
-$img_url = $img_path ? BASE_URL . 'uploads/' . $img_path : '';
-
-echo json_encode([
-    'success' => true,
-    'message' => $approval_status === 'approved'
-        ? 'Dish published successfully!'
-        : 'Dish submitted for approval. An Operations Manager or Owner will review it.',
-    'approval_status' => $approval_status,
+logActivity($conn, $userId, 'Menu draft created', json_encode(['restaurant_id' => $restaurantId, 'menu_item_id' => $menuId]), 'menu_workflow');
+menu_draft_json(true, 'Menu draft saved. Create its recipe and confirm every ingredient mapping before submitting it for review.', [
+    'approval_status' => 'pending',
+    'workflow_status' => 'draft',
     'item' => [
-        'id'              => $new_id,
-        'name'            => $dish_name,
-        'description'     => $dish_desc,
-        'price'           => $dish_price,
-        'category'        => $dish_cat,
-        'serving_type'    => $dish_serving,
-        'image_url'       => $img_url,
-        'approval_status' => $approval_status,
+        'id' => $menuId, 'name' => $name, 'description' => $description,
+        'price' => $price, 'category' => $category, 'serving_type' => $servingType,
+        'image_url' => $imagePath ? BASE_URL . 'uploads/' . $imagePath : '',
+        'approval_status' => 'pending', 'workflow_status' => 'draft',
     ],
 ]);

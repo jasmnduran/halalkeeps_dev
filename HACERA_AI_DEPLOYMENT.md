@@ -14,7 +14,7 @@ Document intelligence is intentionally disabled in this release. The current upl
 ## Install
 
 1. Back up the database. For example, on XAMPP: `C:\xampp\mysql\bin\mysqldump.exe -u root halal_system > halal_system_before_hacera_ai.sql`.
-2. Apply [database/hacera_ai_insights_migration.sql](database/hacera_ai_insights_migration.sql) in phpMyAdmin or with the MySQL CLI.
+2. Apply [database/hacera_ai_insights_migration.sql](database/hacera_ai_insights_migration.sql), then [database_migrations/add_hacera_premium_access.sql](database_migrations/add_hacera_premium_access.sql), in phpMyAdmin or with the MySQL CLI.
 3. Copy the HaCeRa AI variables from `.env.example` to the server `.env`. Keep `HACERA_AI_ENABLED=false` until testing and access review are complete.
 4. Set `HACERA_AI_ENDPOINT`, `HACERA_AI_API_KEY`, and `HACERA_AI_MODEL`. Keep the key in the server environment or `.env`; never put it in JavaScript or source control.
 5. Set a conservative `HACERA_AI_MAX_RUNS_PER_DAY` per restaurant. The adapter retries temporary provider/network failures with exponential backoff by default; adjust `HACERA_AI_MAX_RETRIES` (0–4, default 3) only if necessary.

@@ -8,20 +8,17 @@ declare(strict_types=1);
 require_once __DIR__ . '/../../config/app.php';
 require_once __DIR__ . '/../../includes/HaCeRaCalculator.php';
 require_once __DIR__ . '/../../includes/HaCeRaAIService.php';
+require_once __DIR__ . '/../../includes/RevenuePaymentService.php';
 
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 
-$staff_key = $_SESSION['staff_role_key'] ?? null;
-if ($staff_key !== null) {
-    header('Location: ' . BASE_URL . 'dashboard/business_owner/owner_dashboard.php');
-    exit();
-}
 
 $page_title   = 'HaCeRa — Halal Readiness Assessment';
 $page_heading = 'Halal Readiness Assessment (HaCeRa)';
 $is_dashboard = true;
 $user_id      = (int)$_SESSION['user_id'];
+$revenue_payment_csrf = RevenuePaymentService::ensureCsrfToken();
 $breadcrumbs  = [
     ['label' => 'Owner Dashboard', 'url' => BASE_URL . 'dashboard/business_owner/owner_dashboard.php'],
     ['label' => 'HaCeRa Assessment'],
@@ -53,6 +50,8 @@ $completionRow = $completionStmt->get_result()->fetch_assoc();
 $completionStmt->close();
 $restaurant['hacera_completed_at'] = $completionRow['hacera_completed_at'] ?? null;
 $rest_id = (int)$restaurant['id'];
+$paymentReturn = (string)($_GET['payment'] ?? '');
+if (!in_array($paymentReturn, ['return', 'cancelled', 'verified'], true)) $paymentReturn = '';
 
 // AI Insights is deliberately disabled unless explicitly enabled in .env.
 // Its token is scoped to the owner session and the separate advisory API.
@@ -108,6 +107,12 @@ if ($doc_res) {
     }
 }
 $doc_ids = array_unique($doc_ids);
+$premiumBilling = new RevenuePaymentService($conn);
+$paymentReconciliation = $paymentReturn === 'return' ? $premiumBilling->reconcileHaceraPremiumPayment($user_id, $rest_id) : null;
+$premiumAccess = $premiumBilling->getHaceraPremiumAccess($user_id, $rest_id);
+$premiumUnlocked = $premiumAccess !== null;
+$premiumPurchaseId = $premiumUnlocked ? (int)$premiumAccess['id'] : 0;
+$premiumPrice = $premiumBilling->billingSettings()['hacera_fee'];
 
 $completed_ids = HaCeRaCalculator::buildCompletedIds($responses, $doc_ids);
 $modules       = HaCeRaCalculator::getModules();
@@ -555,9 +560,15 @@ foreach ($step_labels as $sid => $lbl):
                 <button onclick="publishScore()" id="publishBtn" style="background:#fff;color:#065f46;padding:9px 16px;border-radius:10px;font-weight:700;font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:8px;border:none;transition:opacity .15s;white-space:nowrap;" onmouseover="this.style.opacity='.88'" onmouseout="this.style.opacity='1'">
                     <i class="fas fa-globe"></i> Save &amp; Publish
                 </button>
-                <button onclick="generatePDF()" id="pdfBtn" style="background:rgba(255,255,255,.15);border:1.5px solid rgba(255,255,255,.3);color:#fff;padding:9px 16px;border-radius:10px;font-weight:700;font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s;white-space:nowrap;" onmouseover="this.style.background='rgba(255,255,255,.25)'" onmouseout="this.style.background='rgba(255,255,255,.15)'">
-                    <i class="fas fa-file-pdf"></i> Download PDF
+                <?php if ($premiumUnlocked): ?>
+                <button onclick="generatePDF(<?= $premiumPurchaseId ?>)" id="pdfBtn" style="background:rgba(255,255,255,.15);border:1.5px solid rgba(255,255,255,.3);color:#fff;padding:9px 16px;border-radius:10px;font-weight:700;font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s;white-space:nowrap;">
+                    <i class="fas fa-file-pdf"></i> Download Full Report
                 </button>
+                <?php else: ?>
+                <button id="pdfBtn" disabled title="Verified premium payment required" style="background:rgba(255,255,255,.08);border:1.5px solid rgba(255,255,255,.2);color:#d1fae5;padding:9px 16px;border-radius:10px;font-weight:700;font-size:.85rem;cursor:not-allowed;opacity:.75;display:flex;align-items:center;gap:8px;white-space:nowrap;">
+                    <i class="fas fa-lock"></i> Full Report Locked
+                </button>
+                <?php endif; ?>
                 <a href="<?= BASE_URL ?>dashboard/business_owner/applications.php" style="background:rgba(255,255,255,.12);border:1.5px solid rgba(255,255,255,.25);color:#fff;padding:9px 16px;border-radius:10px;font-weight:700;font-size:.85rem;text-decoration:none;display:flex;align-items:center;gap:8px;white-space:nowrap;">
                     <i class="fas fa-paper-plane"></i> Submit Application
                 </a>
@@ -566,6 +577,13 @@ foreach ($step_labels as $sid => $lbl):
     </div>
 
     <div class="card-body" style="padding:24px;">
+        <?php if ($premiumUnlocked): ?>
+        <div style="margin-bottom:16px;padding:11px 13px;border:1px solid #86efac;background:#f0fdf4;border-radius:9px;font-size:.8rem;color:#166534;"><i class="fas fa-circle-check"></i> <strong>Premium Access Active</strong> &mdash; HaCeRa Premium Assessment Results, PHP <?= number_format((float)$premiumAccess['amount'], 2) ?>. Verified <?= htmlspecialchars((string)$premiumAccess['paid_at']) ?> &middot; Receipt <?= htmlspecialchars((string)$premiumAccess['internal_reference']) ?>.</div>
+        <?php elseif ($paymentReturn === 'return'): ?>
+        <div style="margin-bottom:16px;padding:11px 13px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:9px;font-size:.8rem;color:#1d4ed8;"><i class="fas fa-clock"></i> Verifying payment. Premium access will unlock only after the signed PayMongo webhook confirms it.</div>
+        <?php elseif ($paymentReturn === 'cancelled'): ?>
+        <div style="margin-bottom:16px;padding:11px 13px;border:1px solid #fed7aa;background:#fff7ed;border-radius:9px;font-size:.8rem;color:#9a3412;"><i class="fas fa-circle-info"></i> Payment was cancelled. Premium Results remain locked.</div>
+        <?php endif; ?>
         <div class="results-grid">
 
             <!-- Left: Overall gauge -->
@@ -671,6 +689,12 @@ foreach ($step_labels as $sid => $lbl):
 
         <!-- AI Readiness Insights: advisory only; no score or certification controls. -->
         <section id="aiInsightsSection" style="margin-top:28px;border-top:1px solid var(--neutral-200);padding-top:24px;">
+            <?php if (!$premiumUnlocked): ?>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px;">
+                <article style="border:1px solid var(--neutral-200);border-radius:12px;padding:18px;background:linear-gradient(135deg,#f8fafc,#fff);"><h3 style="margin:0 0 6px;font-size:1rem;"><i class="fas fa-lock" style="color:var(--primary-600);"></i> AI Readiness Insights</h3><p style="font-size:.8rem;color:var(--neutral-600);">Prioritized compliance guidance, corrective actions, and evidence-aware recommendations. One verified payment also unlocks the full report.</p><div aria-hidden="true" style="height:34px;border-radius:7px;background:linear-gradient(90deg,#e2e8f0,#f8fafc,#e2e8f0);filter:blur(2px);margin:12px 0;"></div><button type="button" class="btn btn-primary" onclick="unlockPremiumResults()">Unlock AI Insights &amp; Full Report &mdash; &#8369;<?= number_format($premiumPrice, 2) ?></button></article>
+                <article style="border:1px solid var(--neutral-200);border-radius:12px;padding:18px;background:linear-gradient(135deg,#f8fafc,#fff);"><h3 style="margin:0 0 6px;font-size:1rem;"><i class="fas fa-lock" style="color:var(--primary-600);"></i> Full HaCeRa Assessment Report</h3><p style="font-size:.8rem;color:var(--neutral-600);">Complete assessment breakdown and a downloadable PDF for this assessment version. The same verified payment unlocks AI Readiness Insights.</p><div aria-hidden="true" style="height:34px;border-radius:7px;background:linear-gradient(90deg,#e2e8f0,#f8fafc,#e2e8f0);filter:blur(2px);margin:12px 0;"></div><button type="button" class="btn btn-primary" onclick="unlockPremiumResults()">Unlock AI Insights &amp; Full Report &mdash; &#8369;<?= number_format($premiumPrice, 2) ?></button></article>
+            </div>
+            <?php else: ?>
             <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:14px;">
                 <div>
                     <h3 style="margin:0;font-size:1rem;font-weight:800;color:var(--neutral-800);"><i class="fas fa-wand-magic-sparkles" style="color:var(--primary-600);"></i> AI Readiness Insights</h3>
@@ -717,6 +741,7 @@ foreach ($step_labels as $sid => $lbl):
                 </div>
             </div>
             <?php endif; ?>
+            <?php endif; ?>
         </section>
     </div>
 
@@ -732,9 +757,13 @@ foreach ($step_labels as $sid => $lbl):
 
 <script>
 const HACERA_API   = '<?= BASE_URL ?>dashboard/business_owner/api/hacera_api.php';
+const REVENUE_PAYMENT_API = '<?= BASE_URL ?>dashboard/business_owner/api/revenue_payment_api.php';
+const REVENUE_PAYMENT_CSRF = <?= json_encode($revenue_payment_csrf) ?>;
 const HACERA_AI_API = '<?= BASE_URL ?>dashboard/business_owner/api/hacera_ai_api.php';
 const BASE_URL_JS  = '<?= BASE_URL ?>';
 const HACERA_AI_ENABLED = <?= $hacera_ai_enabled ? 'true' : 'false' ?>;
+const HACERA_PREMIUM_UNLOCKED = <?= $premiumUnlocked ? 'true' : 'false' ?>;
+const HACERA_PREMIUM_PURCHASE_ID = <?= $premiumPurchaseId ?>;
 const HACERA_AI_CSRF = <?= json_encode($hacera_ai_csrf_token) ?>;
 const TOTAL_STEPS  = <?= $total_steps ?>;
 const MODULE_COUNT = <?= count($modules) ?>;
@@ -862,7 +891,7 @@ function applyScores(data) {
         if (bar) { bar.style.width = score + '%'; bar.style.background = color; }
         if (pct) { pct.textContent = score + '%'; pct.style.color = color; }
         if (cnt) cnt.textContent = (ms.completed || 0) + '/' + (ms.total || 0) + ' completed';
-        if (gBadge) { const gc = (ms.gaps || []).length; gBadge.textContent = gc ? gc + ' gap' + (gc !== 1 ? 's' : '') : ''; gBadge.style.display = gc ? '' : 'none'; }
+        if (gBadge) { const gc = Number(ms.gap_count ?? (ms.gaps || []).length); gBadge.textContent = gc ? gc + ' gap' + (gc !== 1 ? 's' : '') : ''; gBadge.style.display = gc ? '' : 'none'; }
 
         // Results page mini bars
         const rBar = document.getElementById('res-bar-' + mid);
@@ -1044,30 +1073,38 @@ async function deleteDocument(docId, itemId) {
 }
 
 // ── Generate PDF ──────────────────────────────────────────────────────────
-async function generatePDF() {
+async function generatePDF(purchaseId = 0) {
+    if (purchaseId > 0) {
+        window.location.assign(HACERA_API + '?action=generate_pdf&purchase_id=' + encodeURIComponent(purchaseId));
+        return;
+    }
     const btn = document.getElementById('pdfBtn');
-    const orig = btn.innerHTML;
-    btn.innerHTML = '<span class="hc-spinner"></span> Generating…';
-    btn.disabled  = true;
+    const original = btn.innerHTML;
+    btn.innerHTML = '<span class="hc-spinner"></span> Preparing secure checkout…';
+    btn.disabled = true;
     try {
-        const res = await fetch(HACERA_API + '?action=generate_pdf', { method: 'GET' });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const ct = res.headers.get('Content-Type') || '';
-        if (ct.includes('application/json')) { const d = await res.json(); showToast(d.message || 'PDF failed.', true); return; }
-        const blob = await res.blob();
-        const url  = URL.createObjectURL(blob);
-        const a    = document.createElement('a');
-        a.href = url; a.download = 'HaCeRa_Portfolio_' + new Date().toISOString().slice(0,10) + '.pdf';
-        document.body.appendChild(a); a.click(); a.remove();
-        URL.revokeObjectURL(url);
-        showToast('Portfolio PDF downloaded.');
-    } catch(e) {
-        showToast('PDF download failed: ' + e.message, true);
+        const form = new FormData();
+        form.append('action', 'start_hacera_report');
+        form.append('csrf_token', REVENUE_PAYMENT_CSRF);
+        const response = await fetch(REVENUE_PAYMENT_API, { method: 'POST', body: form });
+        const data = await response.json();
+        if (!data.success) { showToast(data.message || 'Could not start report payment.', true); return; }
+        if (data.ready && data.purchase_id) {
+            window.location.assign(BASE_URL_JS + 'dashboard/business_owner/hacera.php?payment=verified');
+            return;
+        }
+        if (data.checkout_url) { window.location.assign(data.checkout_url); return; }
+        showToast('Payment request created. Wait for verification before downloading.');
+    } catch (error) {
+        showToast('Network error — please try again.', true);
     } finally {
-        btn.innerHTML = orig; btn.disabled = false;
+        btn.innerHTML = original;
+        btn.disabled = false;
     }
 }
-
+function unlockPremiumResults() {
+    generatePDF();
+}
 // ── Publish score ─────────────────────────────────────────────────────────
 async function publishScore() {
     const btn  = document.getElementById('publishBtn');
@@ -1245,7 +1282,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('resultsConfirmOverlay').addEventListener('click', function(e) {
         if (e.target === this) closeResultsConfirm();
     });
-    loadAiHistory();
+    if (HACERA_PREMIUM_UNLOCKED) loadAiHistory();
 });
 </script>
 

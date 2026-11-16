@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../../config/app.php';
+require_once __DIR__ . '/../../includes/MenuWorkflowService.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 requireStaffAccess('Owner Dashboard'); // blocks ops_manager and cashier staff
@@ -204,9 +205,9 @@ $stats = ['total_orders' => 0, 'revenue_today' => 0, 'revenue_week' => 0,
 if ($restaurant_id) {
     $s = $conn->query("SELECT
         COUNT(*) AS total_orders,
-        SUM(CASE WHEN DATE(payment_verified_at) = CURDATE() AND payment_status='paid' THEN (total_amount - delivery_fee) ELSE 0 END) AS revenue_today,
-        SUM(CASE WHEN payment_verified_at >= DATE_SUB(NOW(),INTERVAL 7 DAY) AND payment_status='paid' THEN (total_amount - delivery_fee) ELSE 0 END) AS revenue_week,
-        SUM(CASE WHEN MONTH(payment_verified_at)=MONTH(NOW()) AND YEAR(payment_verified_at)=YEAR(NOW()) AND payment_status='paid' THEN (total_amount - delivery_fee) ELSE 0 END) AS revenue_month,
+        SUM(CASE WHEN DATE(payment_verified_at) = CURDATE() AND payment_status='paid' THEN (total_amount - delivery_fee - COALESCE(platform_fee, 0)) ELSE 0 END) AS revenue_today,
+        SUM(CASE WHEN payment_verified_at >= DATE_SUB(NOW(),INTERVAL 7 DAY) AND payment_status='paid' THEN (total_amount - delivery_fee - COALESCE(platform_fee, 0)) ELSE 0 END) AS revenue_week,
+        SUM(CASE WHEN MONTH(payment_verified_at)=MONTH(NOW()) AND YEAR(payment_verified_at)=YEAR(NOW()) AND payment_status='paid' THEN (total_amount - delivery_fee - COALESCE(platform_fee, 0)) ELSE 0 END) AS revenue_month,
         SUM(CASE WHEN order_status='pending' THEN 1 ELSE 0 END) AS pending_orders
         FROM orders WHERE restaurant_id = $restaurant_id")->fetch_assoc();
     if ($s) $stats = array_merge($stats, $s);
@@ -322,7 +323,7 @@ if ($restaurant_id) {
     // ── Period-aware revenue query ────────────────────────────────────────────
     $revRes = $conn->query("
         SELECT
-            COALESCE(SUM(total_amount - delivery_fee), 0) AS period_revenue,
+            COALESCE(SUM(total_amount - delivery_fee - COALESCE(platform_fee, 0)), 0) AS period_revenue,
             COALESCE(SUM(delivery_fee), 0)               AS period_delivery_fees,
             COUNT(*)                                      AS period_order_count,
             SUM(CASE WHEN order_source='customer' THEN 1 ELSE 0 END) AS customer_orders,
@@ -412,7 +413,7 @@ if ($restaurant_id) {
         SELECT
             payment_method,
             COUNT(*) AS order_count,
-            COALESCE(SUM(total_amount - delivery_fee), 0) AS revenue
+            COALESCE(SUM(total_amount - delivery_fee - COALESCE(platform_fee, 0)), 0) AS revenue
         FROM orders
         WHERE payment_status = 'paid'
           AND $_ord_where
@@ -474,7 +475,7 @@ if ($restaurant_id) {
         SELECT id, type, amount, ts, description FROM (
             SELECT id,
                    CAST('order' AS CHAR CHARACTER SET utf8mb4) AS type,
-                   (total_amount - delivery_fee) AS amount,
+                   (total_amount - delivery_fee - COALESCE(platform_fee, 0)) AS amount,
                    payment_verified_at AS ts,
                    CONVERT(CONCAT('Order #', id, IF(delivery_fee>0,' (food subtotal)','')) USING utf8mb4) AS description
             FROM orders
@@ -517,7 +518,7 @@ if ($restaurant_id) {
         $hourSql = "
             SELECT hour AS slot, COALESCE(SUM(revenue),0) AS revenue, COALESCE(SUM(expense),0) AS expense
             FROM (
-                SELECT HOUR(payment_verified_at) AS hour, SUM(total_amount - delivery_fee) AS revenue, 0 AS expense
+                SELECT HOUR(payment_verified_at) AS hour, SUM(total_amount - delivery_fee - COALESCE(platform_fee, 0)) AS revenue, 0 AS expense
                 FROM orders WHERE payment_status='paid' AND $_ord_where AND restaurant_id=$restaurant_id
                 GROUP BY hour
                 UNION ALL
@@ -537,7 +538,7 @@ if ($restaurant_id) {
     } elseif ($_chart_mode === 'daily' && $fin_period === 'week') {
         $hourSql = "
             SELECT DATE(payment_verified_at) AS slot,
-                   COALESCE(SUM(total_amount - delivery_fee),0) AS revenue,
+                   COALESCE(SUM(total_amount - delivery_fee - COALESCE(platform_fee, 0)),0) AS revenue,
                    0 AS expense
             FROM orders WHERE payment_status='paid' AND $_ord_where AND restaurant_id=$restaurant_id
             GROUP BY DATE(payment_verified_at)
@@ -554,7 +555,7 @@ if ($restaurant_id) {
     } elseif ($_chart_mode === 'daily' && $fin_period === 'month') {
         $hourSql = "
             SELECT DAY(payment_verified_at) AS slot,
-                   COALESCE(SUM(total_amount - delivery_fee),0) AS revenue,
+                   COALESCE(SUM(total_amount - delivery_fee - COALESCE(platform_fee, 0)),0) AS revenue,
                    0 AS expense
             FROM orders WHERE payment_status='paid' AND $_ord_where AND restaurant_id=$restaurant_id
             GROUP BY DAY(payment_verified_at)
@@ -572,7 +573,7 @@ if ($restaurant_id) {
         // year → monthly slots 1-12
         $hourSql = "
             SELECT MONTH(payment_verified_at) AS slot,
-                   COALESCE(SUM(total_amount - delivery_fee),0) AS revenue,
+                   COALESCE(SUM(total_amount - delivery_fee - COALESCE(platform_fee, 0)),0) AS revenue,
                    0 AS expense
             FROM orders WHERE payment_status='paid' AND $_ord_where AND restaurant_id=$restaurant_id
             GROUP BY MONTH(payment_verified_at)
@@ -648,12 +649,12 @@ if ($restaurant_id) {
 $owner_log_order_menu = [];
 if ($restaurant_id) {
     $olom = $conn->query("
-        SELECT id, name, price, category, serving_type
-        FROM menu_items
-        WHERE restaurant_id = $restaurant_id
-          AND approval_status = 'approved'
-          AND is_available = 1
-        ORDER BY category ASC, name ASC
+        SELECT mi.id, mi.name, mi.price, mi.category, mi.serving_type
+        FROM menu_items mi
+        WHERE mi.restaurant_id = $restaurant_id
+          AND " . MenuWorkflowService::customerEligibilitySql('mi') . "
+          AND mi.is_available = 1
+        ORDER BY mi.category ASC, mi.name ASC
     ");
     if ($olom) $owner_log_order_menu = $olom->fetch_all(MYSQLI_ASSOC);
 }
@@ -2660,7 +2661,7 @@ function openFinModal(type) {
         formula.innerHTML =
             '<span class="var">' + _periodLabel + ' Revenue</span> <span class="eq">=</span> ' +
             'Food order subtotals + Approved other inflows (catering, grants, etc.)<br>' +
-            '<span class="eq">Formula:</span> SUM(order.total_amount &minus; delivery_fee) + SUM(approved inflows)<br>' +
+            '<span class="eq">Formula:</span> SUM(order.total_amount &minus; delivery_fee &minus; platform_fee) + SUM(approved inflows)<br>' +
             '<span class="var">Result:</span> ' + _fmt(_fin.revenue);
         logs = _fin.logs.filter(l => l.type === 'order' || l.type === 'inflow');
     } else if (type === 'expense') {

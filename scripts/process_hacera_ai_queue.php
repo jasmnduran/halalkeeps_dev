@@ -16,6 +16,7 @@ require_once __DIR__ . '/../includes/HaCeRaAIService.php';
 require_once __DIR__ . '/../includes/HaCeRaEvidenceValidator.php';
 require_once __DIR__ . '/../includes/HaCeRaInsightsRepository.php';
 require_once __DIR__ . '/../includes/HaCeRaAIProcessor.php';
+require_once __DIR__ . '/../includes/RevenuePaymentService.php';
 
 if (!HaCeRaAIService::isFeatureEnabled()) {
     fwrite(STDERR, "HaCeRa AI is disabled. No jobs processed.\n");
@@ -42,5 +43,18 @@ $processor = new HaCeRaAIProcessor(
     $repository,
     $conn
 );
-$count = $processor->processQueued($limit);
+$billing = new RevenuePaymentService($conn);
+$count = 0;
+while ($count < $limit) {
+    $job = $repository->claimNextQueued();
+    if ($job === null) break;
+    $versionHash = (string)($job['assessment_version_hash'] ?? '');
+    if (!$billing->hasActiveHaceraAssessmentVersion((int)$job['restaurant_id'], $versionHash)) {
+        $repository->markFailed((int)$job['id'], 'premium_access_required', 'The paid premium entitlement is no longer active for this assessment version.');
+        $count++;
+        continue;
+    }
+    $processor->process((int)$job['id'], (int)$job['restaurant_id'], true);
+    $count++;
+}
 fwrite(STDOUT, "Processed {$count} HaCeRa AI job(s).\n");

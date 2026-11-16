@@ -31,6 +31,7 @@
     async function request(action, values) {
         var body = new FormData();
         body.append('action', action);
+        if (window.menuWorkflowCsrf) body.append('csrf_token', window.menuWorkflowCsrf);
         Object.keys(values || {}).forEach(function (key) {
             body.append(key, values[key]);
         });
@@ -83,21 +84,20 @@
         }).length;
         var total = rows.length;
         var status = state.recipe.customer_visibility_status || 'draft';
-        var reviewed = rows.filter(function (row) { return row.mapping_status === 'confirmed' || row.mapping_status === 'rejected'; }).length;
-        var complete = total > 0 && reviewed === total && confirmed > 0;
+        var complete = total > 0 && confirmed === total;
         var statusText = status === 'published'
-            ? 'Published to customers (confirmed ingredients only).'
-            : (status === 'needs_reapproval' ? 'Needs Chef re-approval after a recipe or mapping change.' : 'Not published to customers yet.');
-        var statusColor = status === 'published' ? '#166534' : (status === 'needs_reapproval' ? '#92400e' : '#475569');
+            ? 'Approved by Operations Manager and published for customer eligibility.'
+            : 'Complete all ingredient mappings, then submit to the Operations Manager.';
+        var statusColor = status === 'published' ? '#166534' : '#475569';
         var button = '';
         if (status !== 'published') {
             button = '<button type="button" class="btn btn-primary btn-sm" onclick="publishAIMappingRecipe()"' +
                 (complete ? '' : ' disabled') + ' style="white-space:nowrap;">' +
-                '<i class="fas fa-cloud-arrow-up"></i> Approve recipe for customer listing</button>';
+                '<i class="fas fa-paper-plane"></i> Submit menu for manager review</button>';
         }
         var hint = complete
-            ? 'Every ingredient has been reviewed. Only the ' + confirmed + ' confirmed mapping(s) will be visible to customers; rejected items stay hidden.'
-            : 'Review every ingredient before approving the listing (' + confirmed + '/' + total + ' confirmed; unresolved suggestions remain).';
+            ? 'Every ingredient has a Chef-confirmed inventory mapping. Submit the completed menu for Operations Manager review.'
+            : 'Confirm an inventory mapping for every recipe ingredient before submission (' + confirmed + '/' + total + ' confirmed).';
         target.innerHTML = '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">' +
             '<div><div style="font-size:.78rem;font-weight:800;color:' + statusColor + ';">Customer ingredient listing: ' + escapeHtml(statusText) + '</div>' +
             '<div style="font-size:.74rem;color:#64748b;margin-top:4px;">' + escapeHtml(hint) + '</div></div>' + button + '</div>';
@@ -235,10 +235,10 @@
             return;
         }
         try {
-            await request('approve_recipe_listing', { recipe_id: recipeId });
+            await request('submit_menu_for_approval', { recipe_id: recipeId, menu_item_id: state.menu.id });
             pendingSuggestions = [];
             await window.loadAIMappingRecipe(true);
-            showNotice('Recipe ingredient listing approved by the Chef. Confirmed ingredients are now visible to customers.');
+            showNotice('Completed menu submitted for Operations Manager review. It is not customer-visible until approved.');
         } catch (error) {
             showNotice(error.message, true);
         }

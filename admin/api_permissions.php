@@ -109,9 +109,9 @@ require_once __DIR__ . '/includes/admin_header.php';
     </div>
     <div class="admin-card-body">
         <p style="font-size:.85rem;color:#64748b;margin-bottom:16px">
-            Call <code style="background:#f1f5f9;padding:2px 6px;border-radius:4px">/halal_final/admin/api/check_permission.php?permission=manage_users</code> from any frontend JS to verify access before performing sensitive operations.
+            Call <code style="background:#f1f5f9;padding:2px 6px;border-radius:4px">/admin/api/check_permission.php?permission=manage_users</code> from any frontend JS to verify access before performing sensitive operations.
         </p>
-        <pre style="background:#0f172a;color:#e2e8f0;padding:18px;border-radius:10px;font-size:.8rem;overflow-x:auto">fetch('/halal_final/admin/api/check_permission.php?permission=manage_users')
+        <pre style="background:#0f172a;color:#e2e8f0;padding:18px;border-radius:10px;font-size:.8rem;overflow-x:auto">fetch('/admin/api/check_permission.php?permission=manage_users')
   .then(r => r.json())
   .then(data => {
     if (data.allowed) {

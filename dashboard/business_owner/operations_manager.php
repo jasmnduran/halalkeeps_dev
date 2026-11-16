@@ -1,5 +1,6 @@
-﻿﻿﻿﻿﻿﻿<?php
+<?php
 require_once __DIR__ . '/../../config/app.php';
+require_once __DIR__ . '/../../includes/MenuWorkflowService.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 requireStaffRole($conn, STAFF_ROLE_OPS_MANAGER);
@@ -11,6 +12,7 @@ $breadcrumbs  = [['label' => 'Operations Manager Interface']];
 $user_id = $_SESSION['user_id'];
 $error   = '';
 $success = '';
+$menu_workflow_csrf = MenuWorkflowService::ensureCsrfToken();
 
 // Active tab from query string — sidebar links deep-link via ?tab=
 // Valid tabs: profile, menu, reviews, requisitions, expenses, other_inflows, log_order
@@ -229,7 +231,8 @@ if ($rest_id) {
     $mi = $conn->prepare("
         SELECT mi.id, mi.name, mi.description, mi.price, mi.category,
                mi.serving_type, mi.image_path, mi.is_available,
-               mi.approval_status, mi.rejection_reason, mi.submitted_by, mi.reviewed_at,
+               mi.approval_status, mi.workflow_status, mi.workflow_updated_at, mi.rejection_reason,
+               mi.ingredient_evidence_status, mi.operational_status, mi.submitted_by, mi.reviewed_at,
                u.full_name AS submitted_by_name
         FROM   menu_items mi
         LEFT JOIN users u ON mi.submitted_by = u.id
@@ -241,15 +244,45 @@ if ($rest_id) {
     $all_menu = $mi->get_result()->fetch_all(MYSQLI_ASSOC);
     foreach ($all_menu as $m) {
         if (empty(trim($m['name'] ?? ''))) continue;
-        match ($m['approval_status'] ?? 'approved') {
-            'pending'  => $menu_items_pending[]  = $m,
-            'rejected' => $menu_items_rejected[] = $m,
-            default    => $menu_items_approved[] = $m,
-        };
+        $workflowStatus = $m['workflow_status'] ?? '';
+        if ($workflowStatus === MenuWorkflowService::PENDING_REVIEW) {
+            $menu_items_pending[] = $m;
+        } elseif ($workflowStatus === MenuWorkflowService::REJECTED) {
+            $menu_items_rejected[] = $m;
+        } elseif ($workflowStatus === MenuWorkflowService::APPROVED || ($workflowStatus === MenuWorkflowService::LEGACY && ($m['approval_status'] ?? '') === 'approved')) {
+            $menu_items_approved[] = $m;
+        }
     }
 }
 // Legacy compat: $valid_menu_items still used by the JS bridge (approved only)
 $valid_menu_items = $menu_items_approved;
+
+// Review data is loaded only for completed submissions currently in the manager queue.
+$menu_review_details = [];
+if ($rest_id && !empty($menu_items_pending)) {
+    $pendingIds = implode(',', array_map(static fn(array $row): int => (int)$row['id'], $menu_items_pending));
+    $detailResult = $conn->query("SELECT mr.menu_item_id,mr.id AS recipe_id,mr.recipe_name,mr.serving_size,mr.version_no,
+            ri.id AS recipe_ingredient_id,ri.ingredient_name,ri.quantity_required,ri.unit,ri.mapping_status,
+            ki.ingredient_name AS inventory_name,ki.quantity AS inventory_quantity,ki.unit AS inventory_unit,
+            COALESCE((SELECT SUM(GREATEST(batch.quantity_available-batch.quantity_reserved,0)) FROM ingredient_inventory_batches batch WHERE batch.restaurant_id=mr.restaurant_id AND batch.inventory_id=ri.inventory_id AND batch.batch_status='active' AND (batch.expiration_date IS NULL OR batch.expiration_date>=CURDATE())),0) AS batch_available,
+            aim.confidence_indicator,aim.explanation,aim.potential_substitution_warning,aim.review_status AS ai_review_status
+        FROM menu_recipes mr
+        LEFT JOIN recipe_ingredients ri ON ri.recipe_id=mr.id AND ri.restaurant_id=mr.restaurant_id
+        LEFT JOIN kitchen_inventory ki ON ki.id=ri.inventory_id AND ki.restaurant_id=mr.restaurant_id
+        LEFT JOIN ai_ingredient_mappings aim ON aim.id=(SELECT MAX(latest.id) FROM ai_ingredient_mappings latest WHERE latest.recipe_ingredient_id=ri.id AND latest.restaurant_id=mr.restaurant_id)
+        WHERE mr.restaurant_id={$rest_id} AND mr.menu_item_id IN ({$pendingIds}) AND mr.recipe_status='active'
+        ORDER BY mr.menu_item_id,ri.id");
+    if ($detailResult) {
+        while ($detail = $detailResult->fetch_assoc()) {
+            $menuId = (int)$detail['menu_item_id'];
+            if (!isset($menu_review_details[$menuId])) {
+                $menu_review_details[$menuId] = ['recipe_name' => $detail['recipe_name'], 'serving_size' => $detail['serving_size'], 'version_no' => $detail['version_no'], 'ingredients' => []];
+            }
+            if ($detail['recipe_ingredient_id'] !== null) $menu_review_details[$menuId]['ingredients'][] = $detail;
+        }
+        $detailResult->free();
+    }
+}
 
 // â”€â”€ Ensure restaurant_expenses table exists + has added_by_role column â”€â”€â”€â”€â”€â”€â”€â”€
 $conn->query("CREATE TABLE IF NOT EXISTS `restaurant_expenses` (
@@ -581,12 +614,12 @@ if ($rest_id) {
 $log_order_menu = [];
 if ($rest_id) {
     $lom = $conn->query("
-        SELECT id, name, price, category, serving_type
-        FROM menu_items
-        WHERE restaurant_id = $rest_id
-          AND approval_status = 'approved'
-          AND is_available = 1
-        ORDER BY category ASC, name ASC
+        SELECT mi.id, mi.name, mi.price, mi.category, mi.serving_type
+        FROM menu_items mi
+        WHERE mi.restaurant_id = $rest_id
+          AND " . MenuWorkflowService::customerEligibilitySql('mi') . "
+          AND mi.is_available = 1
+        ORDER BY mi.category ASC, mi.name ASC
     ");
     if ($lom) $log_order_menu = $lom->fetch_all(MYSQLI_ASSOC);
 }
@@ -1136,6 +1169,7 @@ require_once __DIR__ . '/../../includes/header.php';
         <div style="display:flex;flex-direction:column;">
         <?php foreach ($menu_items_pending as $item):
             $img_url = !empty($item['image_path']) ? BASE_URL . 'uploads/' . htmlspecialchars($item['image_path']) : '';
+            $review_detail = $menu_review_details[(int)$item['id']] ?? null;
         ?>
         <div id="approval-row-<?= $item['id'] ?>"
              style="display:flex;align-items:flex-start;gap:14px;padding:16px 20px;
@@ -1157,12 +1191,22 @@ require_once __DIR__ . '/../../includes/header.php';
                     <span><i class="fas fa-peso-sign" style="color:var(--primary-400);"></i> <?= formatCurrency($item['price']) ?></span>
                     <?php if ($item['serving_type']): ?><span><i class="fas fa-bowl-food" style="color:var(--primary-400);"></i> <?= htmlspecialchars($item['serving_type']) ?></span><?php endif; ?>
                     <?php if ($item['submitted_by_name']): ?><span style="color:#8b5cf6;"><i class="fas fa-user"></i> <?= htmlspecialchars($item['submitted_by_name']) ?></span><?php endif; ?>
+                    <?php if ($item['workflow_updated_at']): ?><span><i class="fas fa-clock"></i> Submitted <?= htmlspecialchars($item['workflow_updated_at']) ?></span><?php endif; ?>
+                </div>
+                <div style="margin-top:10px;padding:10px 12px;background:#fff;border:1px solid #fde68a;border-radius:8px;font-size:.76rem;color:#475569;">
+                    <div style="font-weight:800;color:#78350f;">Recipe: <?= htmlspecialchars($review_detail['recipe_name'] ?? 'Missing recipe') ?><?= !empty($review_detail['serving_size']) ? ' &middot; '.htmlspecialchars($review_detail['serving_size']) : '' ?><?= isset($review_detail['version_no']) ? ' &middot; v'.(int)$review_detail['version_no'] : '' ?></div>
+                    <div style="margin-top:3px;">Evidence: <?= htmlspecialchars(str_replace('_', ' ', $item['ingredient_evidence_status'] ?? 'pending_review')) ?> &middot; Availability: <?= htmlspecialchars(str_replace('_', ' ', $item['operational_status'] ?? 'inventory_not_confirmed')) ?></div>
+                    <?php if (!empty($review_detail['ingredients'])): ?><ul style="margin:7px 0 0 17px;padding:0;display:grid;gap:4px;"><?php foreach ($review_detail['ingredients'] as $ingredient): $availableStock = (float)$ingredient['batch_available'] > 0 ? $ingredient['batch_available'] : $ingredient['inventory_quantity']; ?><li><strong><?= htmlspecialchars($ingredient['ingredient_name']) ?></strong> &mdash; <?= htmlspecialchars($ingredient['quantity_required']) ?> <?= htmlspecialchars($ingredient['unit']) ?> required; <?= htmlspecialchars($ingredient['inventory_name'] ?: 'No confirmed inventory') ?> (<?= htmlspecialchars((string)$availableStock) ?> <?= htmlspecialchars($ingredient['inventory_unit'] ?: '') ?> available); mapping: <?= htmlspecialchars($ingredient['mapping_status']) ?><?php if ($ingredient['confidence_indicator']): ?>; AI <?= htmlspecialchars($ingredient['confidence_indicator']) ?> confidence<?php endif; ?><?php if ($ingredient['potential_substitution_warning']): ?><div style="color:#9a3412;">Warning: <?= htmlspecialchars($ingredient['potential_substitution_warning']) ?></div><?php endif; ?></li><?php endforeach; ?></ul><?php else: ?><div style="color:#b91c1c;margin-top:5px;">No active structured recipe ingredients were found.</div><?php endif; ?>
                 </div>
             </div>
             <div style="display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap;align-items:center;">
                 <button type="button" onclick="approveItem(<?= $item['id'] ?>, '<?= htmlspecialchars(addslashes($item['name'])) ?>')"
                         class="btn btn-sm" style="background:#16a34a;color:#fff;border-color:#16a34a;gap:6px;">
                     <i class="fas fa-check"></i> Approve
+                </button>
+                <button type="button" onclick="openRevisionModal(<?= $item['id'] ?>, '<?= htmlspecialchars(addslashes($item['name'])) ?>')"
+                        class="btn btn-sm btn-outline" style="color:#b45309;border-color:#fbbf24;gap:6px;">
+                    <i class="fas fa-rotate-left"></i> Return for revision
                 </button>
                 <button type="button" onclick="openRejectModal(<?= $item['id'] ?>, '<?= htmlspecialchars(addslashes($item['name'])) ?>')"
                         class="btn btn-sm btn-danger" style="gap:6px;">
@@ -1186,11 +1230,11 @@ require_once __DIR__ . '/../../includes/header.php';
                 <i class="fas fa-times" style="color:#dc2626;font-size:1rem;"></i>
             </div>
             <div>
-                <div style="font-weight:800;font-size:1rem;color:var(--neutral-900);">Reject Menu Item</div>
+                <div id="reviewModalTitle" style="font-weight:800;font-size:1rem;color:var(--neutral-900);">Reject Menu Item</div>
                 <div id="rejectModalItemName" style="font-size:.82rem;color:var(--neutral-500);"></div>
             </div>
         </div>
-        <p style="font-size:.875rem;color:var(--neutral-600);margin:0 0 14px;">
+        <p id="reviewModalDescription" style="font-size:.875rem;color:var(--neutral-600);margin:0 0 14px;">
             Provide a clear reason so the chef can revise and resubmit.
         </p>
         <textarea id="rejectReasonInput" maxlength="255" placeholder="e.g. Price is too high, please revise."
@@ -1308,13 +1352,16 @@ require_once __DIR__ . '/../../includes/header.php';
 <script>
 (function(){
     const APPROVAL_URL = <?= json_encode(BASE_URL . 'dashboard/business_owner/api/menu_item_approval.php') ?>;
+    const MENU_WORKFLOW_CSRF = <?= json_encode($menu_workflow_csrf) ?>;
     let _rejectItemId = null;
+    let _reviewAction = 'reject';
 
     window.approveItem = function(itemId, itemName) {
         if (!confirm('Approve "' + itemName + '" and make it live?')) return;
         const fd = new FormData();
         fd.append('action', 'approve');
         fd.append('item_id', itemId);
+        fd.append('csrf_token', MENU_WORKFLOW_CSRF);
         fetch(APPROVAL_URL, {method:'POST',body:fd}).then(r=>r.json()).then(data => {
             if (data.success) {
                 const row = document.getElementById('approval-row-' + itemId);
@@ -1326,12 +1373,24 @@ require_once __DIR__ . '/../../includes/header.php';
 
     window.openRejectModal = function(itemId, itemName) {
         _rejectItemId = itemId;
+        _reviewAction = 'reject';
+        document.getElementById('reviewModalTitle').textContent = 'Reject Menu Item';
+        document.getElementById('reviewModalDescription').textContent = 'Provide a clear reason for the final rejection.';
+        document.getElementById('rejectSubmitBtn').innerHTML = '<i class="fas fa-times"></i> Reject Item';
         document.getElementById('rejectModalItemName').textContent = '"' + itemName + '"';
         document.getElementById('rejectReasonInput').value = '';
         document.getElementById('rejectReasonCount').textContent = '0/255';
         document.getElementById('rejectModalError').style.display = 'none';
         document.getElementById('rejectModalOverlay').style.display = 'flex';
         setTimeout(()=>document.getElementById('rejectReasonInput').focus(), 80);
+    };
+
+    window.openRevisionModal = function(itemId, itemName) {
+        window.openRejectModal(itemId, itemName);
+        _reviewAction = 'needs_revision';
+        document.getElementById('reviewModalTitle').textContent = 'Return Menu for Revision';
+        document.getElementById('reviewModalDescription').textContent = 'Provide actionable feedback. The Chef must revise and resubmit the menu.';
+        document.getElementById('rejectSubmitBtn').innerHTML = '<i class="fas fa-rotate-left"></i> Return for Revision';
     };
 
     window.closeRejectModal = function() {
@@ -1346,18 +1405,19 @@ require_once __DIR__ . '/../../includes/header.php';
         if (!reason) { errEl.textContent='Please enter a rejection reason.'; errEl.style.display='block'; return; }
         errEl.style.display = 'none';
         btn.disabled = true;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Rejecting\u2026';
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving\u2026';
         const fd = new FormData();
-        fd.append('action','reject'); fd.append('item_id',_rejectItemId); fd.append('rejection_reason',reason);
+        fd.append('action', _reviewAction); fd.append('item_id', _rejectItemId); fd.append('review_remarks', reason); fd.append('csrf_token', MENU_WORKFLOW_CSRF);
         fetch(APPROVAL_URL, {method:'POST',body:fd}).then(r=>r.json()).then(data => {
-            btn.disabled=false; btn.innerHTML='<i class="fas fa-times"></i> Reject Item';
+            btn.disabled=false; btn.innerHTML=_reviewAction === 'needs_revision' ? '<i class="fas fa-rotate-left"></i> Return for Revision' : '<i class="fas fa-times"></i> Reject Item';
             if (data.success) {
+                const reviewedId = _rejectItemId;
                 closeRejectModal();
-                const row = document.getElementById('approval-row-' + _rejectItemId);
+                const row = document.getElementById('approval-row-' + reviewedId);
                 if (row) { row.style.transition='opacity .4s'; row.style.opacity='0'; setTimeout(()=>{row.remove();checkEmptyQueue();},420); }
                 showMenuToast(data.message, false);
             } else { errEl.textContent=data.message||'Rejection failed.'; errEl.style.display='block'; }
-        }).catch(()=>{ btn.disabled=false; btn.innerHTML='<i class="fas fa-times"></i> Reject Item'; errEl.textContent='Network error.'; errEl.style.display='block'; });
+        }).catch(()=>{ btn.disabled=false; btn.innerHTML=_reviewAction === 'needs_revision' ? '<i class="fas fa-rotate-left"></i> Return for Revision' : '<i class="fas fa-times"></i> Reject Item'; errEl.textContent='Network error.'; errEl.style.display='block'; });
     };
 
     document.getElementById('rejectModalOverlay').addEventListener('click', function(e){ if(e.target===this) closeRejectModal(); });

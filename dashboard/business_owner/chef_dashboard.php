@@ -1,6 +1,8 @@
 <?php
 require_once __DIR__ . '/../../config/app.php';
 require_once __DIR__ . '/../../includes/IngredientInventoryService.php';
+require_once __DIR__ . '/../../includes/MenuWorkflowService.php';
+require_once __DIR__ . '/../../includes/RevenuePaymentService.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 requireStaffRole($conn, STAFF_ROLE_CHEF);
@@ -11,6 +13,7 @@ $is_dashboard = true;
 $breadcrumbs  = [['label' => 'Chef Dashboard']];
 $user_id      = (int)$_SESSION['user_id'];
 $rest_id      = getSessionRestaurantId($conn);
+$menu_workflow_csrf = MenuWorkflowService::ensureCsrfToken();
 
 
 // ── Schema for onboarding + grocery lists ────────────────────────────────
@@ -168,6 +171,7 @@ if ($rest_id) {
 
 // Active tab from URL query string
 $active_tab = in_array($_GET['tab'] ?? '', ['inventory','suppliers','grocery_lists','categories','recipes','availability','menu_status','menu_submit'], true) ? $_GET['tab'] : 'inventory';
+$inventory_capacity = (new RevenuePaymentService($conn))->getInventoryCapacity($rest_id);
 // Load restaurant details
 $restaurant = null;
 if ($rest_id) {
@@ -434,7 +438,8 @@ if ($rest_id) {
     $cmi = $conn->query("
         SELECT mi.id, mi.name, mi.description, mi.price, mi.category,
                mi.serving_type, mi.image_path, mi.is_available,
-               mi.approval_status, mi.rejection_reason,
+               mi.approval_status, mi.workflow_status, mi.rejection_reason,
+               mi.operational_status, mi.ingredient_evidence_status,
                mi.submitted_by, mi.reviewed_at,
                reviewer.full_name AS reviewed_by_name
         FROM   menu_items mi
@@ -614,7 +619,7 @@ require_once __DIR__ . '/../../includes/header.php';
            style="<?= $active_tab === 'menu_submit' ? 'border-bottom-color:#059669;color:#047857;' : '' ?>">
             <i class="fas fa-paper-plane"></i> Submit Menu
             <?php
-            $pending_count = count(array_filter($chef_menu_items, fn($m) => ($m['approval_status'] ?? '') === 'pending'));
+            $pending_count = count(array_filter($chef_menu_items, fn($m) => ($m['workflow_status'] ?? '') === 'pending_review'));
             if ($pending_count): ?>
             <span style="background:#fef3c7;color:#92400e;font-size:.65rem;padding:1px 6px;border-radius:10px;margin-left:4px;font-weight:800;"><?= $pending_count ?></span>
             <?php endif; ?>
@@ -623,6 +628,10 @@ require_once __DIR__ . '/../../includes/header.php';
 
     <!-- ══ TAB 1: KITCHEN INVENTORY ═════════════════════════════════════════════ -->
     <?php if ($active_tab === 'inventory'): ?>
+        <div class="alert alert-info" style="margin-bottom:14px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;">
+            <span><strong><i class="fas fa-boxes"></i> Ingredient record capacity: <?= (int)$inventory_capacity["used"] ?> / <?= (int)$inventory_capacity["limit"] ?></strong><br><small><?= (int)$inventory_capacity["extra_slots"] ?> active expansion slots. Batches do not use extra slots.</small></span>
+            <?php if ($inventory_capacity["at_capacity"]): ?><span style="font-weight:700;color:#b91c1c;">Limit reached — ask an owner or operations manager to purchase storage.</span><?php endif; ?>
+        </div>
         <div class="card" style="border-radius: 14px; border: 1px solid var(--neutral-200); box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
             <div class="card-header" style="padding: 18px 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; background: #fafafa;">
                 <div>
@@ -1537,10 +1546,12 @@ require_once __DIR__ . '/../../includes/header.php';
     <?php
     $add_url    = BASE_URL . 'dashboard/business_owner/api/add_menu_item.php';
     $update_url = BASE_URL . 'dashboard/business_owner/api/update_menu_item.php';
-    // Split items by status
-    $cmi_pending  = array_values(array_filter($chef_menu_items, fn($m) => ($m['approval_status']??'') === 'pending'));
-    $cmi_approved = array_values(array_filter($chef_menu_items, fn($m) => ($m['approval_status']??'approved') === 'approved'));
-    $cmi_rejected = array_values(array_filter($chef_menu_items, fn($m) => ($m['approval_status']??'') === 'rejected'));
+    // Workflow states are distinct from the legacy approval enum.
+    $cmi_drafts = array_values(array_filter($chef_menu_items, fn($m) => ($m['workflow_status'] ?? '') === 'draft'));
+    $cmi_pending = array_values(array_filter($chef_menu_items, fn($m) => ($m['workflow_status'] ?? '') === 'pending_review'));
+    $cmi_revision = array_values(array_filter($chef_menu_items, fn($m) => ($m['workflow_status'] ?? '') === 'needs_revision'));
+    $cmi_rejected = array_values(array_filter($chef_menu_items, fn($m) => ($m['workflow_status'] ?? '') === 'rejected'));
+    $cmi_approved = array_values(array_filter($chef_menu_items, fn($m) => ($m['workflow_status'] ?? '') === 'approved' || (($m['workflow_status'] ?? '') === 'legacy' && ($m['approval_status'] ?? '') === 'approved')));
     ?>
 
     <!-- Info banner -->
@@ -1550,8 +1561,8 @@ require_once __DIR__ . '/../../includes/header.php';
         <i class="fas fa-info-circle" style="color:#1d4ed8;font-size:1.1rem;margin-top:1px;flex-shrink:0;"></i>
         <div style="font-size:.85rem;color:#1e40af;line-height:1.55;">
             <strong>How menu submissions work:</strong>
-            Items you add or edit go to <em>Pending</em> status and must be approved by the Operations Manager or Owner before going live.
-            Your owner can publish directly without waiting for approval.
+            Create a menu as a <em>Draft</em>, complete its structured recipe, and Chef-confirm every ingredient-to-inventory mapping.
+            Only then can it be submitted to the Operations Manager. Manager approval publishes the reviewed recipe; stock and ingredient evidence are checked separately for orderability.
         </div>
     </div>
 
@@ -1559,7 +1570,7 @@ require_once __DIR__ . '/../../includes/header.php';
     <div class="card" style="margin-bottom:20px;border-radius:14px;border:1px solid var(--neutral-200);">
         <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
             <h3 style="margin:0;display:flex;align-items:center;gap:8px;">
-                <i class="fas fa-plus" style="color:var(--primary-600);"></i> Submit New Menu Item
+                <i class="fas fa-plus" style="color:var(--primary-600);"></i> Create Menu Draft
             </h3>
             <button type="button" id="chefAddDishBtn" class="btn btn-primary btn-sm">
                 <i class="fas fa-plus"></i> Add Dish Row
@@ -1570,17 +1581,45 @@ require_once __DIR__ . '/../../includes/header.php';
             <div id="chefDishRows" style="display:flex;flex-direction:column;gap:14px;"></div>
             <div id="chefMenuSubmitRow" style="display:none;justify-content:flex-end;gap:10px;margin-top:14px;">
                 <button type="button" id="chefSaveMenuBtn" class="btn btn-primary">
-                    <i class="fas fa-paper-plane"></i> Submit for Approval
+                    <i class="fas fa-save"></i> Save Draft
                 </button>
             </div>
             <div id="chefMenuEmpty" style="text-align:center;padding:32px 24px;color:var(--neutral-400);">
                 <i class="fas fa-plus-circle" style="font-size:2rem;margin-bottom:10px;display:block;opacity:.3;"></i>
-                <p style="margin:0;font-size:.9rem;">Click "Add Dish Row" to submit a new menu item for approval.</p>
+                <p style="margin:0;font-size:.9rem;">Click "Add Dish Row" to create a menu draft, then complete its recipe.</p>
             </div>
         </div>
     </div>
 
-    <!-- Pending Submissions -->
+    <!-- Draft Menus -->
+<?php if (!empty($cmi_drafts)): ?>
+<div class="card" style="margin-bottom:20px;border:2px solid #bfdbfe;">
+    <div class="card-header" style="background:#eff6ff;"><h3 style="color:#1d4ed8;margin:0;"><i class="fas fa-pen-ruler"></i> Draft Menus</h3></div>
+    <div class="card-body" style="padding:0;">
+    <?php foreach ($cmi_drafts as $item): $draftMeta = $structured_recipe_meta[(int)$item['id']] ?? null; $isReady = $draftMeta && (int)$draftMeta['total_count'] > 0 && (int)$draftMeta['confirmed_count'] === (int)$draftMeta['total_count']; ?>
+        <div style="display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid #dbeafe;flex-wrap:wrap;">
+            <div style="flex:1;min-width:180px;"><strong><?= htmlspecialchars($item['name']) ?></strong><div style="font-size:.75rem;color:#64748b;"><?= htmlspecialchars($item['category'] ?? '') ?> &middot; <?= formatCurrency($item['price']) ?> &middot; <?= $draftMeta ? (int)$draftMeta['confirmed_count'].'/'.(int)$draftMeta['total_count'].' mappings confirmed' : 'Recipe not created' ?></div></div>
+            <a href="?tab=recipes" class="btn btn-sm btn-outline"><i class="fas fa-scroll"></i> <?= $draftMeta ? 'Complete recipe' : 'Create recipe' ?></a>
+            <?php if ($isReady): ?><button type="button" class="btn btn-sm btn-primary" onclick="submitMenuForManager(<?= (int)$item['id'] ?>)"><i class="fas fa-paper-plane"></i> Submit review</button><?php endif; ?>
+            <button type="button" class="btn btn-sm btn-outline" style="color:#b91c1c;border-color:#fecaca;" onclick="deleteChefMenu(<?= (int)$item['id'] ?>, <?= htmlspecialchars(json_encode($item['name']), ENT_QUOTES) ?>)"><i class="fas fa-trash"></i> Delete</button>
+        </div>
+    <?php endforeach; ?>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- Needs Revision -->
+<?php if (!empty($cmi_revision)): ?>
+<div class="card" style="margin-bottom:20px;border:2px solid #fdba74;">
+    <div class="card-header" style="background:#fff7ed;"><h3 style="color:#9a3412;margin:0;"><i class="fas fa-rotate-left"></i> Needs Revision</h3></div>
+    <div class="card-body" style="padding:0;">
+    <?php foreach ($cmi_revision as $item): ?>
+        <div style="padding:13px 18px;border-bottom:1px solid #fed7aa;"><strong><?= htmlspecialchars($item['name']) ?></strong><div style="font-size:.8rem;color:#9a3412;margin-top:4px;"><strong>Manager feedback:</strong> <?= htmlspecialchars($item['rejection_reason'] ?: 'Review the recipe and resubmit.') ?></div><a href="?tab=recipes" class="btn btn-sm btn-outline" style="margin-top:8px;"><i class="fas fa-scroll"></i> Revise recipe</a> <button type="button" class="btn btn-sm btn-outline" style="margin-top:8px;color:#b91c1c;border-color:#fecaca;" onclick="deleteChefMenu(<?= (int)$item['id'] ?>, <?= htmlspecialchars(json_encode($item['name']), ENT_QUOTES) ?>)"><i class="fas fa-trash"></i> Delete</button></div>
+    <?php endforeach; ?>
+    </div>
+</div>
+<?php endif; ?>
+<!-- Pending Submissions -->
     <?php if (!empty($cmi_pending)): ?>
     <div class="card" style="margin-bottom:20px;border:2px solid #fde68a;">
         <div class="card-header" style="background:#fef3c7;">
@@ -1638,6 +1677,9 @@ require_once __DIR__ . '/../../includes/header.php';
                         class="btn btn-sm btn-outline" style="color:#d97706;border-color:#fde68a;">
                     <i class="fas fa-pencil"></i> Edit &amp; Resubmit
                 </button>
+                <button type="button" class="btn btn-sm btn-outline" style="color:#b91c1c;border-color:#fecaca;" onclick="deleteChefMenu(<?= (int)$item['id'] ?>, <?= htmlspecialchars(json_encode($item['name']), ENT_QUOTES) ?>)">
+                    <i class="fas fa-trash"></i> Delete
+                </button>
             </div>
             <?php if ($item['rejection_reason']): ?>
             <div style="margin-top:10px;padding:9px 13px;background:#fee2e2;border-radius:8px;
@@ -1685,7 +1727,10 @@ require_once __DIR__ . '/../../includes/header.php';
                     class="btn btn-sm btn-outline" title="Edit (will require re-approval)">
                 <i class="fas fa-pencil"></i>
             </button>
-        </div>
+                <button type="button" class="btn btn-sm btn-outline" style="color:#b91c1c;border-color:#fecaca;" title="Delete live menu" onclick="deleteChefMenu(<?= (int)$item['id'] ?>, <?= htmlspecialchars(json_encode($item['name']), ENT_QUOTES) ?>, true)">
+                    <i class="fas fa-trash"></i> Delete
+                </button>
+            </div>
         <?php endforeach; ?>
         </div>
     </div>
@@ -1978,6 +2023,8 @@ require_once __DIR__ . '/../../includes/header.php';
 <script>
 const CHEF_API = 'api/chef_action.php';
 window.ingredientMenuApi = 'api/ingredient_menu_api.php';
+window.menuWorkflowApi = 'api/menu_workflow_api.php';
+window.menuWorkflowCsrf = <?= json_encode($menu_workflow_csrf) ?>;
 
 // ── Category Editor ──────────────────────────────────────────────────────
 const PRESET_CATEGORIES = [
@@ -2518,6 +2565,7 @@ function toggleMenuStatus(menuId, isActive) {
     const UPDATE_URL = <?= json_encode(BASE_URL . 'dashboard/business_owner/api/update_menu_item.php') ?>;
     const CATS       = <?= json_encode(MENU_ITEM_CATEGORIES) ?>;
     const SERVES     = <?= json_encode(ALLOWED_SERVING_TYPES) ?>;
+    const MENU_WORKFLOW_CSRF = window.menuWorkflowCsrf;
 
     let dishCount = 0;
 
@@ -2671,6 +2719,7 @@ function toggleMenuStatus(menuId, isActive) {
                 const url    = isEdit ? UPDATE_URL : ADD_URL;
 
                 const fd = new FormData();
+                fd.append('csrf_token', MENU_WORKFLOW_CSRF);
                 if (isEdit) fd.append('item_id', row.dataset.editId);
                 fd.append('dish_name',         name);
                 fd.append('dish_price',        row.querySelector('.chef-price-input')?.value  ?? '0');
@@ -2690,7 +2739,7 @@ function toggleMenuStatus(menuId, isActive) {
             }
 
             saveBtn.disabled  = false;
-            saveBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit for Approval';
+            saveBtn.innerHTML = '<i class="fas fa-save"></i> Save Draft';
 
             if (!dishRows.querySelectorAll('.dish-row').length) {
                 submitRow.style.display = 'none';
@@ -2698,9 +2747,9 @@ function toggleMenuStatus(menuId, isActive) {
             }
 
             if (saved && !failed)
-                showToast(saved + ' item' + (saved !== 1 ? 's' : '') + ' submitted for approval!', false);
+                showToast(saved + ' menu draft' + (saved !== 1 ? 's' : '') + ' saved. Next: create or complete each recipe.', false);
             else if (saved && failed)
-                showToast(saved + ' submitted, ' + failed + ' failed. Check dish names.', true);
+                showToast(saved + ' draft(s) saved, ' + failed + ' failed. Check the required fields.', true);
             else
                 showToast('Could not submit — make sure dish names are filled in.', true);
 
@@ -2709,6 +2758,49 @@ function toggleMenuStatus(menuId, isActive) {
     }
 })();
 
+window.submitMenuForManager = async function(menuId) {
+    if (!confirm('Submit this completed menu and recipe to the Operations Manager for review?')) return;
+    const body = new FormData();
+    body.append('action', 'submit');
+    body.append('menu_item_id', String(menuId));
+    body.append('csrf_token', window.menuWorkflowCsrf || '');
+    try {
+        const response = await fetch(window.menuWorkflowApi, { method: 'POST', body: body });
+        const result = await response.json();
+        if (!result.success) {
+            const details = Array.isArray(result.errors) && result.errors.length ? '\n• ' + result.errors.join('\n• ') : '';
+            showChefToast((result.message || 'Submission failed.') + details, true);
+            return;
+        }
+        showChefToast(result.message, false);
+        setTimeout(() => location.reload(), 900);
+    } catch (_) {
+        showChefToast('Network error while submitting the menu.', true);
+    }
+};
+
+window.deleteChefMenu = async function(menuId, menuName, isLive = false) {
+    const confirmation = isLive
+        ? 'Delete "' + menuName + '" from the live menu?\n\nThis immediately removes it from customer and POS ordering. Its history will be retained.'
+        : 'Delete "' + menuName + '"? This permanently removes its draft recipe and ingredient mappings.';
+    if (!confirm(confirmation)) return;
+    const body = new FormData();
+    body.append('action', 'delete');
+    body.append('menu_item_id', String(menuId));
+    body.append('csrf_token', window.menuWorkflowCsrf || '');
+    try {
+        const response = await fetch(window.menuWorkflowApi, { method: 'POST', body: body });
+        const result = await response.json();
+        if (!result.success) {
+            showChefToast(result.message || 'Could not delete the menu.', true);
+            return;
+        }
+        showChefToast(result.message, false);
+        setTimeout(() => location.reload(), 650);
+    } catch (_) {
+        showChefToast('Network error while deleting the menu.', true);
+    }
+};
 function toggleMeatSupplierSelect() {
     const isMeat = document.getElementById('inv_is_meat').checked;
     document.getElementById('meatSupplierGroup').style.display = isMeat ? 'block' : 'none';

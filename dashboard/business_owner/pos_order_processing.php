@@ -1,7 +1,9 @@
 <?php
 define('POS_DEBUG', false);
 require_once __DIR__ . '/../../config/app.php';
+require_once __DIR__ . '/../../includes/MenuWorkflowService.php';
 require_once __DIR__ . '/../../includes/IngredientInventoryService.php';
+require_once __DIR__ . '/../../includes/RevenuePaymentService.php';
 requireLogin();
 requireRole([ROLE_BUSINESS_OWNER]);
 // Only the actual owner and cashier staff may access the POS.
@@ -113,7 +115,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order']) && $re
         $qty = max(1, (int)($row['qty'] ?? 1));
         if (!$mid) continue;
         $mi_stmt = $conn->prepare(
-            "SELECT id, name, price FROM menu_items WHERE id = ? AND restaurant_id = ? AND is_available = 1 AND approval_status = 'approved'"
+            "SELECT mi.id, mi.name, mi.price FROM menu_items mi WHERE mi.id = ? AND mi.restaurant_id = ? AND mi.is_available = 1 AND " . MenuWorkflowService::customerEligibilitySql('mi')
         );
         if ($mi_stmt) {
             $mi_stmt->bind_param("ii", $mid, $rest_id);
@@ -143,6 +145,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order']) && $re
         // Cash and card: instant confirmed — money collected in-person
         $online_methods = ['gcash', 'bank_transfer'];
         $is_online = in_array($payment_meth, $online_methods, true);
+        $posBilling = new RevenuePaymentService($conn);
+        $feeDetails = $posBilling->platformFeeForOrder($subtotal, 0.00, $payment_meth);
+        $platform_fee = (float)$feeDetails['amount'];
+        $platform_fee_rate = (float)$feeDetails['rate'];
+        $order_total = round($subtotal + $platform_fee, 2);
 
         $pay_status   = $is_online ? 'pending'   : 'paid';
         $order_status = $is_online ? 'pending'    : 'confirmed';
@@ -158,7 +165,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order']) && $re
         } else {
             $ins->bind_param("siisddsssss",
                 $order_num, $user_id, $rest_id, $items_json,
-                $subtotal, $subtotal,
+                $subtotal, $order_total,
                 $payment_meth, $pay_status, $order_status, $svc_type_raw, $notes);
 
             if (!$ins->execute()) {
@@ -168,6 +175,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order']) && $re
             } else {
                 $order_id = (int)$conn->insert_id;
                 $ins->close();
+                if ($platform_fee > 0) {
+                    $feeUpd = $conn->prepare('UPDATE orders SET platform_fee=?,platform_fee_rate=? WHERE id=?');
+                    $feeUpd->bind_param('ddi', $platform_fee, $platform_fee_rate, $order_id);
+                    $feeUpd->execute();
+                    $feeUpd->close();
+                }
 
                 if (IngredientInventoryService::isFeatureEnabled()) {
                     $reservation = (new IngredientInventoryService($conn))->reserveForOrder($order_id, $rest_id, $line_items, $user_id);
@@ -182,70 +195,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order']) && $re
                     }
                 }
 
-                // ── Online payment: create PayMongo checkout session ──────────
+                // Online payment uses the central checkout request and receives fulfillment only
+// from a signed PayMongo webhook. The return URL is informational.
                 if ($is_online) {
-                    $success_url = BASE_URL . 'dashboard/business_owner/api/pos_payment_callback.php?order_id=' . $order_id . '&status=success';
-                    $cancel_url  = BASE_URL . 'dashboard/business_owner/api/pos_payment_callback.php?order_id=' . $order_id . '&status=cancel';
-                    $description = 'POS Order ' . $order_num . ($restaurant ? ' — ' . $restaurant['restaurant_name'] : '');
-
-                    $checkout = createPayMongoCheckoutSession(
-                        $subtotal,
-                        $description,
-                        $success_url,
-                        $cancel_url,
-                        ['order_id' => (string)$order_id, 'order_number' => $order_num, 'type' => 'pos_order', 'cashier_id' => (string)$user_id]
-                    );
-
-                    if (!$checkout['success']) {
-                        // Roll back order — PayMongo unavailable
+                    if (!$posBilling->schemaReady()) {
                         (new IngredientInventoryService($conn))->releaseOrderReservations($order_id, $user_id);
                         $conn->query("DELETE FROM orders WHERE id = {$order_id}");
-                        $error = 'Payment gateway error: ' . $checkout['message'];
+                        $error = 'Online payments are temporarily unavailable while billing is being installed.';
                         if ($is_ajax) { header('Content-Type: application/json'); echo json_encode(['success'=>false,'message'=>$error]); exit(); }
                     } else {
-                        $cd          = $checkout['data']['data'] ?? [];
-                        $checkout_id  = $cd['id'] ?? '';
-                        $checkout_url = $cd['attributes']['checkout_url'] ?? '';
-
-                        if (empty($checkout_id) || empty($checkout_url)) {
+                        $checkout = $posBilling->startPosOrderCheckout($user_id, $rest_id, $order_id);
+                        if (!$checkout['success']) {
                             (new IngredientInventoryService($conn))->releaseOrderReservations($order_id, $user_id);
                             $conn->query("DELETE FROM orders WHERE id = {$order_id}");
-                            $error = 'Payment gateway did not return a checkout URL.';
+                            $error = $checkout['message'] ?? 'Payment gateway error.';
                             if ($is_ajax) { header('Content-Type: application/json'); echo json_encode(['success'=>false,'message'=>$error]); exit(); }
                         } else {
-                            // Save payments row
-                            $raw_resp = json_encode($checkout['data']);
-                            $pm_ins = $conn->prepare(
-                                "INSERT INTO payments
-                                    (user_id,reference_type,reference_id,amount,payment_method,
-                                     transaction_reference,paymongo_checkout_url,paymongo_raw_response,status)
-                                 VALUES (?,'pos_order',?,?,'paymongo',?,?,?,'pending')"
-                            );
+                            $legacyRaw = json_encode(['billing_payment_request_id'=>$checkout['payment_request_id'],'internal_reference'=>$checkout['internal_reference']]);
+                            $pm_ins = $conn->prepare("INSERT INTO payments (user_id,reference_type,reference_id,amount,payment_method,transaction_reference,paymongo_checkout_url,paymongo_raw_response,status) VALUES (?,'order',?,?,'paymongo',?,?,?,'pending')");
                             if ($pm_ins) {
-                                $pm_ins->bind_param("iidssss",
-                                    $user_id, $order_id, $subtotal,
-                                    $checkout_id, $checkout_url, $raw_resp);
-                                $pm_ins->execute();
-                                $pm_ins->close();
+                                $checkoutId=$checkout['checkout_session_id']; $checkoutUrl=$checkout['checkout_url'];
+                                $pm_ins->bind_param('iidsss',$user_id,$order_id,$order_total,$checkoutId,$checkoutUrl,$legacyRaw);
+                                $pm_ins->execute(); $pm_ins->close();
                             }
-
                             if ($is_ajax) {
                                 header('Content-Type: application/json');
-                                echo json_encode([
-                                    'success'      => true,
-                                    'redirect_url' => $checkout_url,
-                                    'order_number' => $order_num,
-                                    'message'      => 'Redirecting to payment…',
-                                ]);
+                                echo json_encode(['success'=>true,'redirect_url'=>$checkout['checkout_url'],'order_number'=>$order_num,'message'=>'Redirecting to secure payment; confirmation follows webhook verification.']);
                                 exit();
                             }
-                            // Non-AJAX: direct redirect to PayMongo
-                            header('Location: ' . $checkout_url);
+                            header('Location: '.$checkout['checkout_url']);
                             exit();
                         }
                     }
                 } else {
-                    // ── Cash / Card: instant confirmed ────────────────────────
+                    // ── ─ Cash / Card: instant confirmed ────────────────────────
                     $msg = "Order {$order_num} placed — Total: " . formatCurrency($subtotal);
                     if ($is_ajax) {
                         header('Content-Type: application/json');
@@ -266,13 +249,13 @@ $pos_menu_items  = [];
 $menu_by_cat = [];
 if ($rest_id) {
     $menu_result = $conn->query(
-        "SELECT id, name, price, category, image_path, is_available
-         FROM menu_items
-         WHERE restaurant_id = {$rest_id}
-           AND approval_status = 'approved'
-           AND name IS NOT NULL
-           AND name != ''
-         ORDER BY is_available DESC, category, name"
+        "SELECT mi.id, mi.name, mi.price, mi.category, mi.image_path, mi.is_available
+         FROM menu_items mi
+         WHERE mi.restaurant_id = {$rest_id}
+           AND " . MenuWorkflowService::customerEligibilitySql('mi') . "
+           AND mi.name IS NOT NULL
+           AND mi.name != ''
+         ORDER BY mi.is_available DESC, mi.category, mi.name"
     );
     if ($menu_result) {
         while ($m = $menu_result->fetch_assoc()) {
