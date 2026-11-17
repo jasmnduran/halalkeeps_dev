@@ -56,6 +56,30 @@ $conn->query("CREATE TABLE IF NOT EXISTS `restaurant_staff` (
     CONSTRAINT `rs_role_fk`       FOREIGN KEY (`staff_role_id`) REFERENCES `restaurant_staff_roles`(`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 
+// -- Idempotent migration: ensure all orders columns exist --------------------
+// These are added by cash_payment_migration.sql, order_survey_integration_migration.sql,
+// and add_paymongo_revenue_models.sql — guard with db_add_column so the page
+// never 500s on a fresh database that hasn't had every migration applied yet.
+db_add_column($conn, 'orders', 'payment_reference',           "VARCHAR(255) DEFAULT NULL");
+db_add_column($conn, 'orders', 'payment_verified_at',         "DATETIME DEFAULT NULL");
+db_add_column($conn, 'orders', 'platform_fee',                "DECIMAL(12,2) NOT NULL DEFAULT 0.00");
+db_add_column($conn, 'orders', 'platform_fee_rate',           "DECIMAL(7,6) NOT NULL DEFAULT 0.000000");
+db_add_column($conn, 'orders', 'discount_amount',             "DECIMAL(12,2) NOT NULL DEFAULT 0.00");
+db_add_column($conn, 'orders', 'order_source',                "VARCHAR(30) NOT NULL DEFAULT 'customer'");
+db_add_column($conn, 'orders', 'paymongo_checkout_session_id',"VARCHAR(100) DEFAULT NULL");
+db_add_column($conn, 'orders', 'receipt_number',              "VARCHAR(80) DEFAULT NULL");
+db_add_column($conn, 'orders', 'cash_received',               "DECIMAL(10,2) DEFAULT NULL");
+db_add_column($conn, 'orders', 'change_amount',               "DECIMAL(10,2) DEFAULT NULL");
+db_add_column($conn, 'orders', 'payment_confirmed_by',        "INT DEFAULT NULL");
+db_add_column($conn, 'orders', 'service_type',                "VARCHAR(30) NOT NULL DEFAULT 'delivery'");
+db_add_column($conn, 'orders', 'backdated_note',              "TEXT DEFAULT NULL");
+
+// -- Idempotent migration: ensure menu_items columns exist --------------------
+db_add_column($conn, 'menu_items', 'approval_status',           "ENUM('pending','approved','rejected') NOT NULL DEFAULT 'approved'");
+db_add_column($conn, 'menu_items', 'operational_status',        "ENUM('available','unavailable','out_of_stock') NOT NULL DEFAULT 'available'");
+db_add_column($conn, 'menu_items', 'ingredient_evidence_status',"VARCHAR(30) NOT NULL DEFAULT 'unchecked'");
+db_add_column($conn, 'menu_items', 'serving_type',              "VARCHAR(30) NOT NULL DEFAULT 'Per serving'");
+
 // -- Load restaurant with certificate info -----------------------------------
 $rest_stmt = $conn->prepare("
     SELECT hr.*, hc.certificate_number, hc.issue_date, hc.expiry_date, hc.status AS cert_status

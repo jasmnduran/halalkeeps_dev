@@ -970,6 +970,9 @@ function logBusinessView(mysqli $conn, int $restaurant_id): void {
  * }
  */
 function getBusinessTrafficStats(mysqli $conn, int $restaurant_id): array {
+    // Guard: ensure service_type column exists (added by order_survey_integration_migration.sql)
+    db_add_column($conn, 'orders', 'service_type', "VARCHAR(30) NOT NULL DEFAULT 'delivery'");
+
     $stats = [
         'online_views_today'   => 0,
         'online_views_month'   => 0,
